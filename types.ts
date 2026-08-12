@@ -14,21 +14,11 @@ export interface OCRToken {
   pageIndex:number
 }
 
-export interface OCRLine {
-  text:string
-  confidence:number
-  rect:NormalizedRect
-  pageIndex:number
-}
-
 export interface SigningBlock {
   pageIndex:number
   rect:NormalizedRect
   confidence:number
   score:number
-  confirmLine:string
-  dateLine:string
-  signerLine:string
 }
 
 export interface FileResult {

@@ -1,10 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { detectSigningBlocks, scoreFastPageText } from './detection'
 import { recognizeTextFast, recognizeWordsPrecise, terminateOCR } from './ocr'
-import { cropCanvas, loadSource, preprocessCanvas, renderSourcePage } from './source'
-import type { FileResult } from './types'
+import {
+  cropCanvasWithMargin,
+  cropNormalized,
+  getPdfNativeText,
+  loadSource,
+  preprocessCanvas,
+  renderSourcePage
+} from './source'
+import type { FileResult, OCRToken } from './types'
 
-const VERSION='10.0'
+const VERSION='12.0'
 const BUILD='2026-08-12'
 
 const makeId=()=>Math.random().toString(36).slice(2)
@@ -12,7 +19,10 @@ const makeId=()=>Math.random().toString(36).slice(2)
 const emptyResult=(file:File):FileResult=>({
   id:makeId(),
   fileName:file.name,
-  fileType:file.type==='application/pdf'||file.name.toLowerCase().endsWith('.pdf')?'pdf':'image',
+  fileType:
+    file.type==='application/pdf'||
+    file.name.toLowerCase().endsWith('.pdf')
+      ?'pdf':'image',
   status:'queued',
   progress:0,
   message:'대기 중',
@@ -23,121 +33,240 @@ const emptyResult=(file:File):FileResult=>({
   elapsedMs:0
 })
 
+function remapTokens(
+  tokens:OCRToken[],
+  roi:{x:number;y:number;width:number;height:number}
+){
+  return tokens.map(t=>({
+    ...t,
+    rect:{
+      x:roi.x+t.rect.x*roi.width,
+      y:roi.y+t.rect.y*roi.height,
+      width:t.rect.width*roi.width,
+      height:t.rect.height*roi.height
+    }
+  }))
+}
+
 export default function App(){
   const [files,setFiles]=useState<File[]>([])
   const [results,setResults]=useState<FileResult[]>([])
   const [processing,setProcessing]=useState(false)
+
   const inputRef=useRef<HTMLInputElement>(null)
-  const progressTimers=useRef<Record<number,number>>({})
+  const timers=useRef<Record<number,number>>({})
 
   useEffect(()=>()=>{terminateOCR()},[])
 
   const update=(index:number,patch:Partial<FileResult>)=>{
-    setResults(prev=>prev.map((r,i)=>i===index?{...r,...patch}:r))
+    setResults(prev=>prev.map((r,i)=>
+      i===index?{...r,...patch}:r
+    ))
   }
 
-  const stopSmoothProgress=(index:number)=>{
-    const id=progressTimers.current[index]
+  const stopProgress=(index:number)=>{
+    const id=timers.current[index]
     if(id){
       clearInterval(id)
-      delete progressTimers.current[index]
+      delete timers.current[index]
     }
   }
 
-  const startSmoothProgress=(index:number)=>{
-    stopSmoothProgress(index)
-    progressTimers.current[index]=window.setInterval(()=>{
+  const startProgress=(index:number)=>{
+    stopProgress(index)
+
+    timers.current[index]=window.setInterval(()=>{
       setResults(prev=>prev.map((r,i)=>{
         if(i!==index||r.status!=='processing')return r
-        const ceiling=r.progress<40?40:r.progress<70?70:r.progress<92?92:97
-        return r.progress<ceiling?{...r,progress:r.progress+1}:r
+
+        const ceiling=
+          r.progress<40?40:
+          r.progress<70?70:
+          r.progress<91?91:97
+
+        return r.progress<ceiling
+          ?{...r,progress:r.progress+1}
+          :r
       }))
-    },110)
+    },105)
   }
 
-  async function preciseDetect(
-    src:Awaited<ReturnType<typeof loadSource>>,
+  async function preciseImageFallback(
+    rendered:HTMLCanvasElement,
     pageIndex:number,
-    fileType:'pdf'|'image',
     index:number
   ){
-    const maxSide=fileType==='image'?3200:2400
-    const rendered=await renderSourcePage(src,pageIndex,maxSide,true)
+    const rois=[
+      {x:0,y:.48,width:1,height:.52},
+      {x:0,y:.24,width:1,height:.52}
+    ]
 
-    // First OCR pass
-    let precise=preprocessCanvas(rendered,fileType==='image')
-    let tokens=await recognizeWordsPrecise(precise,pageIndex,(p,s)=>{
+    let allTokens:OCRToken[]=[]
+
+    for(let i=0;i<rois.length;i++){
       update(index,{
-        progress:Math.max(58,58+Math.round(p*26)),
-        message:'서명영역 정밀 판독 중'
+        progress:88+i*4,
+        message:'이미지 세부 영역 재판독 중'
       })
-    })
 
-    let blocks=detectSigningBlocks(tokens)
+      const roiCanvas=cropNormalized(rendered,rois[i])
+      const processed=preprocessCanvas(
+        roiCanvas,
+        i===0?'strong':'binary'
+      )
 
-    // JPG/PNG fallback: second preprocessing variant only if first failed.
-    if(!blocks.length&&fileType==='image'){
-      update(index,{progress:86,message:'이미지 OCR 보정 재시도 중'})
-      precise=preprocessCanvas(rendered,false)
-      tokens=await recognizeWordsPrecise(precise,pageIndex,(p)=>{
-        update(index,{progress:Math.max(86,86+Math.round(p*8))})
-      })
-      blocks=detectSigningBlocks(tokens)
+      const tokens=await recognizeWordsPrecise(
+        processed,
+        pageIndex,
+        undefined,
+        true
+      )
+
+      allTokens.push(...remapTokens(tokens,rois[i]))
     }
 
-    return{precise,block:blocks[0]??null}
+    return allTokens
   }
 
-  async function processOne(file:File,index:number){
+  async function processOne(
+    file:File,
+    index:number
+  ){
     const started=performance.now()
-    const fileType:FileResult['fileType']=
-      file.type==='application/pdf'||file.name.toLowerCase().endsWith('.pdf')?'pdf':'image'
 
-    update(index,{status:'processing',progress:1,message:'파일 여는 중'})
-    startSmoothProgress(index)
+    const fileType:FileResult['fileType']=
+      file.type==='application/pdf'||
+      file.name.toLowerCase().endsWith('.pdf')
+        ?'pdf':'image'
+
+    update(index,{
+      status:'processing',
+      progress:1,
+      message:'파일 여는 중'
+    })
+
+    startProgress(index)
 
     const src=await loadSource(file)
+
     update(index,{
       pageCount:src.pageCount,
-      progress:7,
+      progress:6,
       message:'서명 페이지 찾는 중'
     })
 
     let best:{pageIndex:number;score:number}|null=null
 
-    // Page selection only. Result never merges pages.
-    for(let p=0;p<src.pageCount;p++){
-      const fastMax=fileType==='image'?1500:950
-      const canvas=await renderSourcePage(src,p,fastMax,fileType==='image')
-      const fast=await recognizeTextFast(
-        preprocessCanvas(canvas,fileType==='image')
-      )
+    if(fileType==='pdf'){
+      // v12: PDF는 먼저 내장 텍스트 레이어만 읽는다. OCR보다 훨씬 빠르다.
+      // 텍스트 레이어가 없는 스캔 PDF일 때만 저해상도 OCR fallback.
+      let nativeFound=false
+      for(let p=0;p<src.pageCount;p++){
+        const text=await getPdfNativeText(src,p)
+        const score=scoreFastPageText(text)
+        if(text.trim()) nativeFound=true
+        if(!best||score>best.score) best={pageIndex:p,score}
+        update(index,{
+          progress:10+Math.round(((p+1)/src.pageCount)*22),
+          message:`서명 페이지 탐색 ${p+1}/${src.pageCount}`
+        })
+      }
 
-      const score=scoreFastPageText(fast.text)+fast.confidence*.03
-      if(!best||score>best.score)best={pageIndex:p,score}
-
-      update(index,{
-        progress:Math.max(12,10+Math.round(((p+1)/src.pageCount)*38)),
-        message:`서명 페이지 탐색 ${p+1}/${src.pageCount}`
-      })
+      if(!nativeFound || !best || best.score<100){
+        best=null
+        for(let p=0;p<src.pageCount;p++){
+          const canvas=await renderSourcePage(src,p,900,false)
+          const fast=await recognizeTextFast(preprocessCanvas(canvas,'strong'))
+          const score=scoreFastPageText(fast.text)+fast.confidence*.03
+          if(!best||score>best.score) best={pageIndex:p,score}
+          update(index,{
+            progress:32+Math.round(((p+1)/src.pageCount)*18),
+            message:`스캔 PDF 탐색 ${p+1}/${src.pageCount}`
+          })
+        }
+      }
+    }else{
+      // JPG/PNG는 페이지 탐색 OCR을 따로 하지 않는다.
+      // 같은 이미지를 두 번 OCR하던 v11의 병목 제거.
+      best={pageIndex:0,score:999}
+      update(index,{progress:34,message:'이미지 서명영역 분석 준비'})
     }
 
-    if(!best)throw new Error('서명 페이지 후보를 찾지 못했습니다.')
+    if(!best){
+      throw new Error('서명 페이지 후보를 찾지 못했습니다.')
+    }
 
     update(index,{
-      progress:56,
+      progress:55,
       message:`${best.pageIndex+1}페이지 서명영역 분석 중`
     })
 
-    const {precise,block}=await preciseDetect(
+    const preciseMax=fileType==='image'?3000:2300
+
+    const rendered=await renderSourcePage(
       src,
       best.pageIndex,
-      fileType,
-      index
+      preciseMax,
+      true
     )
 
-    if(!block){
-      stopSmoothProgress(index)
+    let processed=preprocessCanvas(
+      rendered,
+      fileType==='image'?'strong':'normal'
+    )
+
+    let tokens=await recognizeWordsPrecise(
+      processed,
+      best.pageIndex,
+      p=>{
+        update(index,{
+          progress:Math.max(
+            56,
+            56+Math.round(p*27)
+          ),
+          message:'서명영역 정밀 판독 중'
+        })
+      },
+      fileType==='image'
+    )
+
+    let blocks=detectSigningBlocks(tokens)
+
+    if(!blocks.length&&fileType==='image'){
+      update(index,{
+        progress:85,
+        message:'이미지 OCR 보정 재시도 중'
+      })
+
+      processed=preprocessCanvas(rendered,'binary')
+
+      tokens=await recognizeWordsPrecise(
+        processed,
+        best.pageIndex
+      )
+
+      blocks=detectSigningBlocks(tokens)
+    }
+
+    if(!blocks.length&&fileType==='image'){
+      const bandTokens=await preciseImageFallback(
+        rendered,
+        best.pageIndex,
+        index
+      )
+
+      blocks=detectSigningBlocks(bandTokens)
+
+      if(blocks.length){
+        tokens=bandTokens
+      }
+    }
+
+    const top=blocks[0]??null
+
+    if(!top){
+      stopProgress(index)
+
       update(index,{
         status:'failed',
         progress:100,
@@ -145,19 +274,27 @@ export default function App(){
         pageIndex:best.pageIndex,
         elapsedMs:performance.now()-started
       })
+
       return
     }
 
-    const crop=cropCanvas(precise,block.rect)
+    // 최종 결과는 원본 렌더 이미지에서,
+    // 탐지된 년/월/일 + 매수인 + 서명 영역에 40px margin만 추가.
+    const crop=cropCanvasWithMargin(
+      rendered,
+      top.rect,
+      40
+    )
 
-    stopSmoothProgress(index)
+    stopProgress(index)
+
     update(index,{
       status:'success',
       progress:100,
       message:'서명영역 탐지 완료',
       pageIndex:best.pageIndex,
-      confidence:block.confidence,
-      cropPreview:crop.toDataURL('image/jpeg',.97),
+      confidence:top.confidence,
+      cropPreview:crop.toDataURL('image/jpeg',.98),
       elapsedMs:performance.now()-started
     })
   }
@@ -172,11 +309,14 @@ export default function App(){
       try{
         await processOne(files[i],i)
       }catch(e){
-        stopSmoothProgress(i)
+        stopProgress(i)
+
         update(i,{
           status:'failed',
           progress:100,
-          message:`오류: ${e instanceof Error?e.message:String(e)}`
+          message:`오류: ${
+            e instanceof Error?e.message:String(e)
+          }`
         })
       }
     }
@@ -190,13 +330,16 @@ export default function App(){
     const arr=Array.from(list)
       .filter(f=>{
         const n=f.name.toLowerCase()
-        return f.type==='application/pdf'||
+
+        return(
+          f.type==='application/pdf'||
           f.type==='image/jpeg'||
           f.type==='image/png'||
           n.endsWith('.pdf')||
           n.endsWith('.jpg')||
           n.endsWith('.jpeg')||
           n.endsWith('.png')
+        )
       })
       .slice(0,5)
 
@@ -204,36 +347,64 @@ export default function App(){
     setResults([])
   }
 
-  function judge(index:number,j:FileResult['judgement']){
+  function judge(
+    index:number,
+    j:FileResult['judgement']
+  ){
     update(index,{judgement:j})
   }
 
   const stats=useMemo(()=>{
     const judged=results.filter(r=>r.judgement)
-    const correct=judged.filter(r=>r.judgement==='correct').length
-    const partial=judged.filter(r=>r.judgement==='partial').length
+
+    const correct=judged.filter(
+      r=>r.judgement==='correct'
+    ).length
+
+    const partial=judged.filter(
+      r=>r.judgement==='partial'
+    ).length
+
     const total=judged.length
 
     return{
       total,
-      exact:total?Math.round(correct/total*100):0,
-      usable:total?Math.round((correct+partial)/total*100):0
+      exact:total
+        ?Math.round(correct/total*100)
+        :0,
+      usable:total
+        ?Math.round((correct+partial)/total*100)
+        :0
     }
   },[results])
 
   return <div className="app">
     <header>
-      <p className="eyebrow">SIGNING AREA ONLY</p>
-      <h1>서명영역 탐지 검수 v{VERSION}</h1>
-      <div className="versionBadge">BUILD {VERSION} · {BUILD}</div>
+      <p className="eyebrow">
+        BLANK DATE + BUYER SIGNING AREA
+      </p>
+
+      <h1>
+        서명영역 탐지 검수 v{VERSION}
+      </h1>
+
+      <div className="versionBadge">
+        BUILD {VERSION} · {BUILD}
+      </div>
+
       <p className="sub">
-        여러 페이지 중 실제 서명 페이지 하나만 선택하고, 날짜·매수인·서명 영역만 확대합니다.
+        숫자가 입력되지 않은 년·월·일과
+        매수인·서명 영역만 확대합니다.
       </p>
     </header>
 
     <section
-      className={`dropzone ${processing?'disabled':''}`}
-      onClick={()=>!processing&&inputRef.current?.click()}
+      className={`dropzone ${
+        processing?'disabled':''
+      }`}
+      onClick={()=>
+        !processing&&inputRef.current?.click()
+      }
     >
       <input
         ref={inputRef}
@@ -241,65 +412,93 @@ export default function App(){
         multiple
         accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"
         hidden
-        onChange={e=>selectFiles(e.target.files)}
+        onChange={e=>
+          selectFiles(e.target.files)
+        }
       />
+
       <div className="uploadIcon">5</div>
+
       <strong>
-        {files.length?`${files.length}개 파일 선택됨`:'PDF / JPG / PNG 최대 5개'}
+        {files.length
+          ?`${files.length}개 파일 선택됨`
+          :'PDF / JPG / PNG 최대 5개'
+        }
       </strong>
-      <span>PDF와 이미지의 서명영역 탐지 정확도를 테스트합니다.</span>
+
+      <span>
+        비어 있는 날짜·매수인 서명란만 탐지합니다.
+      </span>
     </section>
 
-    {files.length>0&&<section className="batchList">
-      {files.map((f,i)=>
-        <div className="fileChip" key={f.name+i}>
-          <b>{i+1}</b>
-          <span>{f.name}</span>
-        </div>
-      )}
-      <button
-        className="startBtn"
-        disabled={processing}
-        onClick={start}
-      >
-        {processing?'분석 중…':'분석 시작'}
-      </button>
-    </section>}
+    {files.length>0&&
+      <section className="batchList">
+        {files.map((f,i)=>
+          <div
+            className="fileChip"
+            key={f.name+i}
+          >
+            <b>{i+1}</b>
+            <span>{f.name}</span>
+          </div>
+        )}
+
+        <button
+          className="startBtn"
+          disabled={processing}
+          onClick={start}
+        >
+          {processing?'분석 중…':'분석 시작'}
+        </button>
+      </section>
+    }
 
     {results.map((r,i)=>
-      <section className="resultCard card" key={r.id}>
+      <section
+        className="resultCard card"
+        key={r.id}
+      >
         <div className="resultTop">
           <div>
-            <p className="label">FILE {i+1}</p>
+            <p className="label">
+              FILE {i+1}
+            </p>
             <h2>{r.fileName}</h2>
           </div>
+
           {r.status==='success'&&
             <span className="successBadge">
-              {Math.round(r.confidence*100)}%
+              {Math.round(
+                r.confidence*100
+              )}%
             </span>
           }
         </div>
 
-        <div className="statusTop">
-          <strong>{r.message}</strong>
-          <span className="bigPercent">{r.progress}%</span>
-        </div>
-        <div className="progress">
-          <i style={{width:`${r.progress}%`}}/>
-        </div>
+        {r.status==='processing'&&<>
+          <div className="statusTop">
+            <strong>{r.message}</strong>
+            <span className="bigPercent">
+              {r.progress}%
+            </span>
+          </div>
+
+          <div className="progress">
+            <i
+              style={{
+                width:`${r.progress}%`
+              }}
+            />
+          </div>
+        </>}
 
         {r.cropPreview&&
           <div className="signatureOnly">
             <div className="signatureHeader">
               <h3>서명영역</h3>
-              <span>
-                {r.pageIndex!==null&&r.pageCount>1
-                  ?`${r.pageIndex+1}/${r.pageCount} 페이지`
-                  :''}
-              </span>
             </div>
 
-            <div className="signatureCrop">
+            <div className="signatureCrop v11Crop">
               <img
                 src={r.cropPreview}
                 alt="탐지된 서명영역"
@@ -308,23 +507,46 @@ export default function App(){
           </div>
         }
 
+        {r.status==='failed'&&
+          <div className="failureText">
+            서명영역을 찾지 못했습니다.
+          </div>
+        }
+
         {r.status==='success'&&
           <div className="judgeButtons">
             <button
-              className={r.judgement==='correct'?'selected':''}
-              onClick={()=>judge(i,'correct')}
+              className={
+                r.judgement==='correct'
+                  ?'selected':''
+              }
+              onClick={()=>
+                judge(i,'correct')
+              }
             >
               정확함
             </button>
+
             <button
-              className={r.judgement==='partial'?'selected':''}
-              onClick={()=>judge(i,'partial')}
+              className={
+                r.judgement==='partial'
+                  ?'selected':''
+              }
+              onClick={()=>
+                judge(i,'partial')
+              }
             >
               일부 포함
             </button>
+
             <button
-              className={r.judgement==='wrong'?'selected':''}
-              onClick={()=>judge(i,'wrong')}
+              className={
+                r.judgement==='wrong'
+                  ?'selected':''
+              }
+              onClick={()=>
+                judge(i,'wrong')
+              }
             >
               틀림
             </button>
@@ -335,9 +557,20 @@ export default function App(){
 
     {stats.total>0&&
       <section className="stats compactStats">
-        <div><span>평가</span><strong>{stats.total}</strong></div>
-        <div><span>Exact</span><strong>{stats.exact}%</strong></div>
-        <div><span>Usable</span><strong>{stats.usable}%</strong></div>
+        <div>
+          <span>평가</span>
+          <strong>{stats.total}</strong>
+        </div>
+
+        <div>
+          <span>Exact</span>
+          <strong>{stats.exact}%</strong>
+        </div>
+
+        <div>
+          <span>Usable</span>
+          <strong>{stats.usable}%</strong>
+        </div>
       </section>
     }
   </div>
