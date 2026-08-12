@@ -1,8 +1,17 @@
-import type { NormalizedRect, OCRToken, Rotation, SigningCluster } from './types'
+import type { NormalizedRect, OCRLine, OCRToken, SigningBlock } from './types'
 
-const clean=(s:string)=>s.replace(/\s+/g,'').replace(/[.,:;_\-|]/g,'').replace(/[［\[]/g,'(').replace(/[］\]]/g,')')
-
-function lev(a:string,b:string){
+const clean=(s:string)=>s.replace(/\s+/g,'').replace(/[.,:;_\-|·]/g,'').replace(/[［\[]/g,'(').replace(/[］\]]/g,')')
+const clamp=(r:NormalizedRect):NormalizedRect=>{
+  const x=Math.max(0,Math.min(1,r.x)), y=Math.max(0,Math.min(1,r.y))
+  const x1=Math.max(x,Math.min(1,r.x+r.width)), y1=Math.max(y,Math.min(1,r.y+r.height))
+  return {x,y,width:x1-x,height:y1-y}
+}
+function union(rs:NormalizedRect[]):NormalizedRect{
+  const x0=Math.min(...rs.map(r=>r.x)), y0=Math.min(...rs.map(r=>r.y))
+  const x1=Math.max(...rs.map(r=>r.x+r.width)), y1=Math.max(...rs.map(r=>r.y+r.height))
+  return {x:x0,y:y0,width:x1-x0,height:y1-y0}
+}
+function levenshtein(a:string,b:string){
   const aa=clean(a),bb=clean(b)
   const dp=Array.from({length:aa.length+1},()=>Array(bb.length+1).fill(0))
   for(let i=0;i<=aa.length;i++)dp[i][0]=i
@@ -13,116 +22,182 @@ function lev(a:string,b:string){
   }
   return dp[aa.length][bb.length]
 }
-export function sim(a:string,b:string){
+function similarity(a:string,b:string){
   const aa=clean(a),bb=clean(b)
   if(!aa||!bb)return 0
   if(aa===bb)return 1
   if(aa.includes(bb)||bb.includes(aa))return Math.min(.99,.78+Math.min(aa.length,bb.length)/Math.max(aa.length,bb.length)*.2)
-  return 1-lev(aa,bb)/Math.max(aa.length,bb.length)
+  return 1-levenshtein(aa,bb)/Math.max(aa.length,bb.length)
 }
-const center=(r:NormalizedRect)=>({x:r.x+r.width/2,y:r.y+r.height/2})
-const clamp=(r:NormalizedRect):NormalizedRect=>{
-  const x=Math.max(0,Math.min(1,r.x)),y=Math.max(0,Math.min(1,r.y))
-  const x1=Math.max(x,Math.min(1,r.x+r.width)),y1=Math.max(y,Math.min(1,r.y+r.height))
-  return{x,y,width:x1-x,height:y1-y}
-}
-function union(rs:NormalizedRect[]):NormalizedRect{
-  const x0=Math.min(...rs.map(r=>r.x)),y0=Math.min(...rs.map(r=>r.y))
-  const x1=Math.max(...rs.map(r=>r.x+r.width)),y1=Math.max(...rs.map(r=>r.y+r.height))
-  return{x:x0,y:y0,width:x1-x0,height:y1-y0}
-}
-function joined(tokens:OCRToken[]){
-  const out=[...tokens]
-  const sorted=[...tokens].sort((a,b)=>center(a.rect).y-center(b.rect).y||a.rect.x-b.rect.x)
-  for(let i=0;i<sorted.length;i++)for(let len=2;len<=5&&i+len<=sorted.length;len++){
-    const g=sorted.slice(i,i+len),ys=g.map(t=>center(t.rect).y)
-    if(Math.max(...ys)-Math.min(...ys)>.025)break
-    if(g.slice(1).some((t,k)=>t.rect.x-(g[k].rect.x+g[k].rect.width)>.05))break
-    out.push({
-      text:g.map(t=>t.text).join(''),
-      confidence:Math.min(...g.map(t=>t.confidence)),
-      pageIndex:g[0].pageIndex,
-      rect:union(g.map(t=>t.rect))
-    })
+const cy=(r:NormalizedRect)=>r.y+r.height/2
+
+export function tokensToLines(tokens:OCRToken[]):OCRLine[]{
+  const sorted=[...tokens].sort((a,b)=>cy(a.rect)-cy(b.rect)||a.rect.x-b.rect.x)
+  const groups:OCRToken[][]=[]
+
+  for(const token of sorted){
+    let best:OCRToken[]|null=null
+    let bestDy=Infinity
+    for(const g of groups){
+      const gy=g.reduce((s,t)=>s+cy(t.rect),0)/g.length
+      const dy=Math.abs(cy(token.rect)-gy)
+      const avgH=g.reduce((s,t)=>s+t.rect.height,0)/g.length
+      if(dy<Math.max(.012,avgH*.7) && dy<bestDy){
+        best=g;bestDy=dy
+      }
+    }
+    if(best)best.push(token)
+    else groups.push([token])
   }
-  return out
+
+  return groups.map(g=>{
+    const ordered=[...g].sort((a,b)=>a.rect.x-b.rect.x)
+    return{
+      text:ordered.map(t=>t.text).join(' '),
+      confidence:ordered.reduce((s,t)=>s+t.confidence,0)/ordered.length,
+      rect:union(ordered.map(t=>t.rect)),
+      pageIndex:ordered[0].pageIndex,
+    }
+  }).sort((a,b)=>a.rect.y-b.rect.y)
 }
 
-export function scoreOrientationText(text:string){
-  const t=clean(text)
-  const confirm=Math.max(sim(t,'확인합니다'), t.includes('확인합니다')?1:0)
-  const signer=Math.max(
-    t.includes('서명')?1:0,
-    t.includes('(인)')?1:0,
-    t.includes('인')?.55:0
+function confirmScore(text:string){
+  const s=clean(text)
+  let score=0
+  if(s.includes('확인합니다'))score=1
+  else score=Math.max(
+    similarity(s,'확인합니다'),
+    similarity(s,'사실을확인합니다'),
+    similarity(s,'사실을확인함니다'),
+    similarity(s,'확인함니다')
   )
-  const date=(t.includes('연월일')||t.includes('년월일')||(t.includes('년')&&t.includes('월')&&t.includes('일')))?1:0
-  const hangul=(text.match(/[가-힣]/g)||[]).length
-  return confirm*90 + date*65 + signer*55 + Math.min(25,hangul/10)
+  // phrases in supplied samples
+  if(s.includes('사실'))score+=.10
+  if(s.includes('본인은'))score+=.08
+  return Math.min(1.2,score)
+}
+function dateScore(text:string){
+  const s=clean(text)
+  let score=0
+  if(s.includes('연월일')||s.includes('년월일'))score=.95
+  if(s.includes('년')&&s.includes('월')&&s.includes('일'))score=Math.max(score,1)
+  if(/\d{4}년?\d{1,2}월?\d{1,2}일?/.test(s))score=Math.max(score,.92)
+  if(/\d{4}[-./]\d{1,2}[-./]\d{1,2}/.test(s))score=Math.max(score,.9)
+  return score
+}
+function signerScore(text:string){
+  const s=clean(text)
+  let score=0
+  if(s.includes('서명또는인'))score=1
+  if(s.includes('(인)'))score=Math.max(score,.92)
+  if(s.includes('매수인'))score=Math.max(score,.9)
+  if(s.includes('서명'))score=Math.max(score,.88)
+  if(s.includes('고지자'))score=Math.max(score,.72)
+  if(s.includes('점검자'))score=Math.max(score,.62)
+  // multiple "인" marks in line is a strong clue
+  const inCount=(s.match(/인/g)||[]).length
+  if(inCount>=2)score=Math.max(score,.8)
+  return score
 }
 
-export function unrotateRect(r:NormalizedRect,rotation:Rotation):NormalizedRect{
-  if(rotation===0)return r
-  const pts=[[r.x,r.y],[r.x+r.width,r.y],[r.x,r.y+r.height],[r.x+r.width,r.y+r.height]].map(([x,y])=>{
-    if(rotation===90)return[y,1-x]
-    if(rotation===180)return[1-x,1-y]
-    return[1-y,x]
+function cropAround(lines:OCRLine[]){
+  const core=union(lines.map(l=>l.rect))
+  return clamp({
+    x:Math.max(0,core.x-.055),
+    y:Math.max(0,core.y-.035),
+    width:Math.min(.96,Math.max(.48,core.width+.11)),
+    height:Math.min(.38,Math.max(.13,core.height+.08)),
   })
-  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1])
-  return clamp({x:Math.min(...xs),y:Math.min(...ys),width:Math.max(...xs)-Math.min(...xs),height:Math.max(...ys)-Math.min(...ys)})
 }
 
-export function detectSigningClusters(tokens:OCRToken[],rotation:Rotation):SigningCluster[]{
-  const all=joined(tokens)
+export function detectSigningBlocks(tokens:OCRToken[]):SigningBlock[]{
+  const lines=tokensToLines(tokens)
+  const confirms=lines.map(l=>({line:l,score:confirmScore(l.text)})).filter(x=>x.score>=.52)
+  const dates=lines.map(l=>({line:l,score:dateScore(l.text)})).filter(x=>x.score>=.55)
+  const signers=lines.map(l=>({line:l,score:signerScore(l.text)})).filter(x=>x.score>=.55)
+  const blocks:SigningBlock[]=[]
 
-  const confirms=all.filter(t=>sim(t.text,'확인합니다')>=.58 || clean(t.text).includes('확인합니다'))
-  const dates=all.filter(t=>{
-    const s=clean(t.text)
-    return sim(s,'연월일')>=.62 || sim(s,'년월일')>=.62 || s==='년' || s==='월' || s==='일'
-  })
-  const signers=all.filter(t=>{
-    const s=clean(t.text)
-    return sim(s,'서명')>=.62 || sim(s,'(인)')>=.62 || s==='인' || sim(s,'성명')>=.68 || sim(s,'매수인')>=.68
-  })
-
-  const blocks:SigningCluster[]=[]
-
-  // Strategy is strict:
-  // one candidate exists only when confirm + date + signer are spatially close.
+  // Primary strategy based on supplied samples:
+  // confirm sentence first, then date/signature rows at or below it.
   for(const c of confirms){
     for(const d of dates){
+      const dyDate=d.line.rect.y-c.line.rect.y
+      if(dyDate < -.03 || dyDate > .24)continue
+
       for(const s of signers){
-        const cc=center(c.rect),dc=center(d.rect),sc=center(s.rect)
-        const maxDy=Math.max(Math.abs(cc.y-dc.y),Math.abs(cc.y-sc.y),Math.abs(dc.y-sc.y))
-        const maxDx=Math.max(Math.abs(cc.x-dc.x),Math.abs(cc.x-sc.x),Math.abs(dc.x-sc.x))
-        if(maxDy>.20 || maxDx>.78) continue
+        const dySigner=s.line.rect.y-c.line.rect.y
+        if(dySigner < -.04 || dySigner > .28)continue
 
-        let score=180
-        score-=maxDy*420
-        score-=maxDx*50
-        score+=sim(c.text,'확인합니다')*35
-        score+=Math.min(18,(c.confidence+d.confidence+s.confidence)/14)
+        // Date/signature should belong to the same local block.
+        const localY=Math.abs((d.line.rect.y+d.line.rect.height/2)-(s.line.rect.y+s.line.rect.height/2))
+        if(localY>.18)continue
 
-        const core=union([c.rect,d.rect,s.rect])
-        const rotatedRect=clamp({
-          x:Math.max(0,core.x-.07),
-          y:Math.max(0,core.y-.06),
-          width:Math.min(.92,Math.max(.48,core.width+.22)),
-          height:Math.min(.34,Math.max(.14,core.height+.14))
-        })
+        let score=160
+        score+=c.score*45+d.score*32+s.score*38
+        score-=Math.max(0,dyDate)*80
+        score-=Math.max(0,dySigner)*55
+        score-=localY*80
+
+        // Prefer samples' common order: confirm -> date -> signer/buyer.
+        if(d.line.rect.y>=c.line.rect.y)score+=12
+        if(s.line.rect.y>=c.line.rect.y)score+=10
+
+        const rect=cropAround([c.line,d.line,s.line])
 
         blocks.push({
-          pageIndex:c.pageIndex,
-          rotation,
-          rotatedRect,
-          rect:unrotateRect(rotatedRect,rotation),
-          confidence:Math.max(.35,Math.min(.99,score/210)),
+          pageIndex:c.line.pageIndex,
+          rect,
+          confidence:Math.max(.35,Math.min(.99,score/260)),
           score,
-          matched:{confirm:c.text,date:d.text,signer:s.text}
+          confirmLine:c.line.text,
+          dateLine:d.line.text,
+          signerLine:s.line.text,
+        })
+      }
+    }
+  }
+
+  // Fallback: if OCR misses "확인합니다" but date + signer are clearly paired,
+  // only allow when they are very close and located in the same lower/local block.
+  if(!blocks.length){
+    for(const d of dates){
+      for(const s of signers){
+        const localY=Math.abs(cy(d.line.rect)-cy(s.line.rect))
+        const localX=Math.abs((d.line.rect.x+d.line.rect.width/2)-(s.line.rect.x+s.line.rect.width/2))
+        if(localY>.10||localX>.55)continue
+
+        // Find nearest weak confirm-like line above.
+        const weak=lines
+          .map(l=>({line:l,score:confirmScore(l.text)}))
+          .filter(x=>x.line.rect.y<=Math.max(d.line.rect.y,s.line.rect.y)+.03 && x.line.rect.y>=Math.min(d.line.rect.y,s.line.rect.y)-.22)
+          .sort((a,b)=>b.score-a.score)[0]
+
+        if(!weak||weak.score<.35)continue
+
+        const score=130+d.score*32+s.score*38+weak.score*35-localY*100
+        blocks.push({
+          pageIndex:d.line.pageIndex,
+          rect:cropAround([weak.line,d.line,s.line]),
+          confidence:Math.max(.35,Math.min(.9,score/240)),
+          score,
+          confirmLine:weak.line.text,
+          dateLine:d.line.text,
+          signerLine:s.line.text,
         })
       }
     }
   }
 
   return blocks.sort((a,b)=>b.score-a.score).slice(0,3)
+}
+
+export function scoreFastPageText(text:string){
+  const s=clean(text)
+  let score=0
+  if(s.includes('확인합니다'))score+=80
+  if(s.includes('사실'))score+=16
+  if((s.includes('년')&&s.includes('월')&&s.includes('일'))||s.includes('연월일')||s.includes('년월일'))score+=55
+  if(s.includes('서명')||s.includes('(인)')||s.includes('매수인'))score+=45
+  if(s.includes('본인은'))score+=12
+  return score
 }

@@ -4,3 +4,8 @@
 .correctedPreview img{display:block;width:100%;height:auto;object-fit:contain}
 .matchedGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:10px}
 .matchedGrid span{background:#f7f7f7;border-radius:8px;padding:7px;font-size:11px}
+
+.matchedStack{display:flex;flex-direction:column;gap:7px;margin-top:12px}
+.matchedStack div{display:grid;grid-template-columns:72px 1fr;gap:8px;background:#f7f7f7;padding:8px 10px;border-radius:9px;align-items:start}
+.matchedStack span{font-size:11px;color:#777}
+.matchedStack b{font-size:12px;line-height:1.45;word-break:break-all}

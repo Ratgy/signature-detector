@@ -1,4 +1,4 @@
-export type Rotation = 0 | 90 | 180 | 270
+export type Rotation = 0
 
 export interface NormalizedRect {
   x: number
@@ -14,24 +14,21 @@ export interface OCRToken {
   pageIndex: number
 }
 
-export interface SigningCluster {
-  pageIndex: number
-  rotation: Rotation
-  rect: NormalizedRect
-  rotatedRect: NormalizedRect
+export interface OCRLine {
+  text: string
   confidence: number
-  score: number
-  matched: {
-    confirm: string
-    date: string
-    signer: string
-  }
+  rect: NormalizedRect
+  pageIndex: number
 }
 
-export interface SourcePage {
+export interface SigningBlock {
   pageIndex: number
-  rotation: Rotation
-  canvas: HTMLCanvasElement
+  rect: NormalizedRect
+  confidence: number
+  score: number
+  confirmLine: string
+  dateLine: string
+  signerLine: string
 }
 
 export interface FileResult {
@@ -43,11 +40,10 @@ export interface FileResult {
   message: string
   pageCount: number
   pageIndex: number | null
-  rotation: Rotation
   confidence: number
-  correctedPreview: string | null
+  fullPreview: string | null
   cropPreview: string | null
   elapsedMs: number
-  matched: {confirm:string; date:string; signer:string} | null
+  matched: { confirm:string; date:string; signer:string } | null
   judgement?: 'correct' | 'partial' | 'wrong' | 'failed'
 }
