@@ -62,3 +62,12 @@ export interface SavedResult {
   pageIndex: number | null
   judgement: TestJudgement
 }
+
+
+export interface SignatureTarget {
+  pageIndex: number
+  rotation: Rotation
+  rect: NormalizedRect
+  source: 'date-anchor' | 'buyer-anchor' | 'blank-line' | 'fallback'
+  confidence: number
+}

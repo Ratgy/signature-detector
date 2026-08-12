@@ -1,134 +1,143 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { detectSignatureCandidates, scoreFastText } from './detection'
+import { detectExactSignatureTarget, roiTokenToPage, scoreFastText } from './detection'
 import { recognizeTextFast, recognizeWordsPrecise, terminateOCR } from './ocr'
-import { loadPdf, preprocessCanvas, renderPageFast, renderPagePrecise, renderPagePreview, ROTATIONS } from './pdf'
-import type { PageAnalysis, SavedResult, SignatureCandidate, TestJudgement } from './types'
+import { cropCanvas, loadPdf, normalizedRectForBottomBand, preprocessCanvas, renderPageFast, renderPagePrecise, renderPagePreview, ROTATIONS } from './pdf'
+import type { NormalizedRect, OCRToken, Rotation, SignatureTarget } from './types'
 
-const STORAGE_KEY='signature-detector-results-v2'
 const pct=(n:number)=>`${Math.round(n*100)}%`
-const loadSaved=():SavedResult[]=>{try{return JSON.parse(localStorage.getItem(STORAGE_KEY)??'[]')}catch{return[]}}
 
 export default function App(){
   const [file,setFile]=useState<File|null>(null)
   const [status,setStatus]=useState('PDF를 올려주세요')
   const [progress,setProgress]=useState(0)
-  const [analyses,setAnalyses]=useState<PageAnalysis[]>([])
-  const [candidateIndex,setCandidateIndex]=useState(0)
-  const [debug,setDebug]=useState(false)
   const [processing,setProcessing]=useState(false)
-  const [saved,setSaved]=useState<SavedResult[]>(loadSaved())
-  const [timing,setTiming]=useState<{fast:number,precise:number,total:number}|null>(null)
+  const [preview,setPreview]=useState<string|null>(null)
+  const [cropUrl,setCropUrl]=useState<string|null>(null)
+  const [target,setTarget]=useState<SignatureTarget|null>(null)
+  const [tokens,setTokens]=useState<OCRToken[]>([])
+  const [timing,setTiming]=useState<{orient:number;precise:number;total:number}|null>(null)
+  const [signature,setSignature]=useState<string|null>(null)
   const inputRef=useRef<HTMLInputElement>(null)
-
-  const candidates=useMemo(()=>analyses.flatMap(a=>a.candidates).sort((a,b)=>b.score-a.score).slice(0,3),[analyses])
-  const candidate=candidates[candidateIndex]??null
-  const activePage=candidate?analyses.find(a=>a.pageIndex===candidate.pageIndex):analyses[0]
   useEffect(()=>()=>{terminateOCR()},[])
 
   async function analyzePdf(selected:File){
-    setFile(selected);setProcessing(true);setAnalyses([]);setCandidateIndex(0);setProgress(0);setTiming(null)
-    const totalStarted=performance.now()
+    setFile(selected);setProcessing(true);setProgress(0);setTarget(null);setSignature(null);setCropUrl(null);setPreview(null);setTiming(null)
+    const started=performance.now()
     try{
       const pdf=await loadPdf(selected)
-      setStatus('문서 방향과 서명 페이지를 빠르게 찾는 중…')
-      const fastStarted=performance.now()
-      let best:{pageIndex:number;rotation:any;score:number;hits:string[]}|null=null
+      // Prioritize the last page first, because signing blocks are commonly there; fallback to earlier pages only if needed.
+      const pageOrder=[...Array(pdf.numPages)].map((_,i)=>pdf.numPages-1-i)
+      let best:{pageIndex:number;rotation:Rotation;score:number}|null=null
+      const orientStart=performance.now()
+      setStatus('마지막 페이지부터 서명 영역 방향을 찾는 중…')
 
-      // PASS 1: low-res text-only. Avoid expensive word boxes for every page/rotation.
-      for(let p=1;p<=pdf.numPages;p++){
-        const page=await pdf.getPage(p)
-        for(let r=0;r<ROTATIONS.length;r++){
-          const rotation=ROTATIONS[r]
-          setStatus(`${p}/${pdf.numPages} 페이지 방향 확인 · ${rotation}°`)
+      for(let oi=0;oi<pageOrder.length;oi++){
+        const pageIndex=pageOrder[oi]
+        const page=await pdf.getPage(pageIndex+1)
+        // First try 0°, then other rotations only if 0° has weak anchors.
+        for(let ri=0;ri<ROTATIONS.length;ri++){
+          const rotation=ROTATIONS[ri]
+          setStatus(`${pageIndex+1}페이지 · ${rotation}° 빠른 확인`)
           const small=preprocessCanvas(await renderPageFast(page,rotation))
-          const result=await recognizeTextFast(small)
+          const bottom=normalizedRectForBottomBand(.46)
+          const roi=cropCanvas(small,bottom)
+          const result=await recognizeTextFast(roi)
           const scored=scoreFastText(result.text)
-          const combined=scored.score + result.confidence*.12
-          if(!best || combined>best.score) best={pageIndex:p-1,rotation,score:combined,hits:scored.hits}
-          // Signature anchors found strongly: no need to OCR other rotations of this page.
-          if(scored.score>=90) break
+          const combined=scored.score+result.confidence*.08
+          if(!best||combined>best.score)best={pageIndex,rotation,score:combined}
+          if(scored.score>=78)break
         }
-        setProgress((p/pdf.numPages)*.58)
+        setProgress(Math.min(.48,(oi+1)/pageOrder.length*.48))
+        if(best && best.score>=92)break
       }
-      const fastMs=performance.now()-fastStarted
-      if(!best) throw new Error('문서 방향을 판단하지 못했습니다.')
+      if(!best)throw new Error('서명 페이지를 찾지 못했습니다.')
+      const orientMs=performance.now()-orientStart
 
-      // PASS 2: only once, on the selected page + orientation.
-      setStatus(`${best.pageIndex+1}페이지 ${best.rotation}° 정밀 OCR 중…`)
-      const preciseStarted=performance.now()
+      // One precise OCR only: selected page + selected rotation + bottom band only.
+      const preciseStart=performance.now()
+      setStatus(`${best.pageIndex+1}페이지 서명영역만 정밀 확인 중…`)
       const page=await pdf.getPage(best.pageIndex+1)
-      const preciseCanvas=preprocessCanvas(await renderPagePrecise(page,best.rotation))
-      const tokens=await recognizeWordsPrecise(preciseCanvas,best.pageIndex,(v,s)=>{
-        setProgress(.58+v*.40);setStatus(`서명 영역 정밀 탐지 · ${s}`)
+      const precise=preprocessCanvas(await renderPagePrecise(page,best.rotation))
+      const roiRect=normalizedRectForBottomBand(.48)
+      const roiCanvas=cropCanvas(precise,roiRect)
+      const roiTokens=await recognizeWordsPrecise(roiCanvas,best.pageIndex,(v,s)=>{
+        setProgress(.48+v*.48);setStatus(`서명란 정밀 탐지 · ${s}`)
       })
-      const pageCandidates=detectSignatureCandidates(tokens,best.rotation)
-      const previewDataUrl=await renderPagePreview(page,0)
-      const analysis:PageAnalysis={
-        pageIndex:best.pageIndex,width:preciseCanvas.width,height:preciseCanvas.height,
-        rotation:best.rotation,tokens,candidates:pageCandidates,previewDataUrl,
-        ocrDataUrl:preciseCanvas.toDataURL('image/jpeg',.84),elapsedMs:performance.now()-preciseStarted,
+      const pageTokens=roiTokens.map(t=>roiTokenToPage(t,roiRect))
+      const exact=detectExactSignatureTarget(pageTokens,best.rotation)
+      setTokens(pageTokens)
+
+      const pagePreview=await renderPagePreview(page,0)
+      setPreview(pagePreview)
+      if(exact){
+        setTarget(exact)
+        // For the signing UI, crop from the currently rotated precise canvas.
+        // exact.rect is unrotated page coords, so derive rotated-space target again from page tokens via detector:
+        const rotatedExact=detectExactSignatureTarget(pageTokens,0)?.rect ?? exact.rect
+        const signingCrop=cropCanvas(precise, rotatedExact)
+        setCropUrl(signingCrop.toDataURL('image/jpeg',.92))
+        setStatus('서명해야 할 최종 영역을 찾았어요')
+      }else{
+        setStatus('최종 연·월·일 / 서명 영역을 정확히 찾지 못했어요')
       }
-      setAnalyses([analysis]);setProgress(1)
-      const preciseMs=performance.now()-preciseStarted
-      setTiming({fast:fastMs,precise:preciseMs,total:performance.now()-totalStarted})
-      if(!pageCandidates.length) setStatus('년·월·일 + 서명/인 영역을 찾지 못했어요')
-      else setStatus(`서명 영역을 찾았어요 · ${best.rotation}° 방향`)
+
+      const preciseMs=performance.now()-preciseStart
+      setTiming({orient:orientMs,precise:preciseMs,total:performance.now()-started})
+      setProgress(1)
     }catch(e){
       console.error(e);setStatus(`오류: ${e instanceof Error?e.message:String(e)}`)
     }finally{setProcessing(false)}
   }
 
-  function judge(j:TestJudgement){
-    if(!file)return
-    const list=loadSaved()
-    list.push({fileName:file.name,timestamp:Date.now(),score:candidate?.score??0,confidence:candidate?.confidence??0,pageIndex:candidate?.pageIndex??null,judgement:j})
-    localStorage.setItem(STORAGE_KEY,JSON.stringify(list));setSaved(loadSaved())
-  }
-  const stats=useMemo(()=>{
-    const total=saved.length,c=(v:TestJudgement)=>saved.filter(s=>s.judgement===v).length
-    const correct=c('correct'),partial=c('partial')
-    return{total,correct,partial,exact:total?correct/total:0,usable:total?(correct+partial)/total:0}
-  },[saved])
-
   return <div className="app">
-    <header><div><p className="eyebrow">FAST TWO-PASS OCR · MOBILE WEB</p><h1>서명영역 탐지 v2</h1><p className="sub">저해상도로 방향/페이지를 먼저 찾고, 선택된 1페이지만 정밀 OCR합니다.</p></div>
-      <button className="ghost" onClick={()=>setDebug(v=>!v)}>{debug?'DEV 끄기':'DEV'}</button></header>
+    <header><div><p className="eyebrow">ROI-FIRST OCR · SIGNATURE FLOW</p><h1>서명영역 탐지 v3</h1><p className="sub">마지막 페이지 하단부터 탐색하고, 최종 연·월·일/서명 행만 확대합니다.</p></div></header>
 
-    <section className={`dropzone ${processing?'disabled':''}`} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();const f=e.dataTransfer.files?.[0];if(f)analyzePdf(f)}} onClick={()=>!processing&&inputRef.current?.click()}>
+    <section className={`dropzone ${processing?'disabled':''}`} onClick={()=>!processing&&inputRef.current?.click()}>
       <input ref={inputRef} type="file" accept="application/pdf,.pdf" hidden onChange={e=>{const f=e.target.files?.[0];if(f)analyzePdf(f)}}/>
-      <div className="uploadIcon">PDF</div><strong>{file?file.name:'성능점검기록부 PDF 업로드'}</strong>
-      <span>{processing?'빠른 탐지 중입니다.':'휴대폰에서 PDF를 선택하세요.'}</span>
+      <div className="uploadIcon">PDF</div><strong>{file?file.name:'성능점검기록부 PDF 업로드'}</strong><span>{processing?'탐지 중…':'휴대폰에서 PDF를 선택하세요.'}</span>
     </section>
 
-    {(processing||file)&&<section className="statusCard"><div className="statusTop"><strong>{status}</strong><span>{Math.round(progress*100)}%</span></div>
-      <div className="progress"><i style={{width:`${progress*100}%`}}/></div>
-      <small>1차: 방향/페이지 탐색 → 2차: 선택 페이지만 정밀 OCR</small>
-      {timing&&<div className="timing">방향 탐색 {(timing.fast/1000).toFixed(1)}s · 정밀 OCR {(timing.precise/1000).toFixed(1)}s · 총 {(timing.total/1000).toFixed(1)}s</div>}
-    </section>}
+    {(processing||file)&&<section className="statusCard"><div className="statusTop"><strong>{status}</strong><span>{Math.round(progress*100)}%</span></div><div className="progress"><i style={{width:`${progress*100}%`}}/></div>
+      <small>마지막 페이지 하단 ROI → 방향 선택 → ROI 1회 정밀 OCR</small>
+      {timing&&<div className="timing">방향 {(timing.orient/1000).toFixed(1)}s · 정밀 {(timing.precise/1000).toFixed(1)}s · 총 {(timing.total/1000).toFixed(1)}s</div>}</section>}
 
-    {!processing&&file&&analyses.length>0&&<><section className="resultGrid">
-      <article className="card cropCard"><div className="cardHead"><div><p className="label">TARGET AREA ONLY</p><h2>{candidate?`후보 ${candidateIndex+1} · ${pct(candidate.confidence)}`:'탐지 실패'}</h2></div>
-        {candidate&&<span className="confidence high">{candidate.rotation}°</span>}</div>
-        {candidate&&activePage?<><CropPreview imageUrl={activePage.ocrDataUrl} rect={candidate.rotatedRect}/><div className="chips">{candidate.matchedKeywords.map(k=><span key={k}>{k}</span>)}</div>
-        <div className="candidateNav"><button disabled={candidateIndex===0} onClick={()=>setCandidateIndex(i=>Math.max(0,i-1))}>이전</button><b>{candidateIndex+1} / {candidates.length}</b><button disabled={candidateIndex>=candidates.length-1} onClick={()=>setCandidateIndex(i=>Math.min(candidates.length-1,i+1))}>다음</button></div></>
-        :<div className="emptyResult">‘년·월·일’과 ‘서명/인/매수인’이 함께 있는 영역만 후보로 인정합니다.</div>}
-      </article>
-      <article className="card fullCard"><div className="cardHead"><div><p className="label">FULL PAGE</p><h2>전체 문서에서 보기</h2></div>{candidate&&<span className="pageBadge">{candidate.pageIndex+1}페이지</span>}</div>
-        {activePage&&<FullPagePreview imageUrl={activePage.previewDataUrl} rect={candidate?.rect??null}/>}</article>
-    </section>
+    {!processing&&target&&cropUrl&&<>
+      <section className="card" style={{marginTop:16}}>
+        <div className="cardHead"><div><p className="label">EXACT SIGNING AREA</p><h2>이 영역에 서명해 주세요</h2></div><span className="confidence high">{pct(target.confidence)}</span></div>
+        <img src={cropUrl} alt="서명 영역" style={{width:'100%',border:'1px solid #ddd',borderRadius:12}}/>
+        <div className="chips"><span>연·월·일</span><span>매수인/서명</span><span>최종행만</span></div>
+      </section>
 
-    <section className="judgeCard"><div><strong>탐지 결과는 어땠나요?</strong><span>정확/일부 포함만 빠르게 기록해 주세요.</span></div><div className="judgeButtons">
-      <button onClick={()=>judge('correct')}>정확함</button><button onClick={()=>judge('partial')}>일부 포함</button><button onClick={()=>judge('wrong')}>틀림</button><button onClick={()=>judge('failed')}>탐지 실패</button></div></section>
+      <SignaturePad onChange={setSignature}/>
 
-    {debug&&<section className="debugGrid"><article className="card"><p className="label">DETECTION DEBUG</p><pre>{JSON.stringify(candidate?{page:candidate.pageIndex+1,rotation:candidate.rotation,score:candidate.score,confidence:candidate.confidence,matchedKeywords:candidate.matchedKeywords,rect:candidate.rect,breakdown:candidate.breakdown}:null,null,2)}</pre></article>
-      <article className="card"><p className="label">OCR TOKENS</p><div className="tokenList">{(activePage?.tokens??[]).slice(0,160).map((t,i)=><span key={i}>{t.text} <em>{Math.round(t.confidence)}</em></span>)}</div></article></section>}
-    <section className="stats"><div><span>테스트</span><strong>{stats.total}</strong></div><div><span>정확</span><strong>{stats.correct}</strong></div><div><span>일부 포함</span><strong>{stats.partial}</strong></div><div><span>Exact</span><strong>{pct(stats.exact)}</strong></div><div><span>Usable</span><strong>{pct(stats.usable)}</strong></div></section></>}
+      {preview&&<section className="card" style={{marginTop:16}}>
+        <div className="cardHead"><div><p className="label">FULL PDF PAGE</p><h2>전체 문서 위치</h2></div><span className="pageBadge">{target.pageIndex+1}페이지</span></div>
+        <div className="pagePreview"><img src={preview} alt="PDF 페이지"/><div className="detectedRect" style={{left:`${target.rect.x*100}%`,top:`${target.rect.y*100}%`,width:`${target.rect.width*100}%`,height:`${target.rect.height*100}%`}}><span>서명 위치</span></div></div>
+      </section>}
+
+      <section className="judgeCard">
+        <div><strong>{signature?'서명이 입력되었습니다.':'아래 패드에 서명해 주세요.'}</strong><span>다음 단계에서는 이 서명을 원본 PDF 좌표에 합성하면 됩니다.</span></div>
+        <button className="primaryBtn" disabled={!signature}>서명 적용</button>
+      </section>
+    </>}
   </div>
 }
-function CropPreview({imageUrl,rect}:{imageUrl:string,rect:{x:number,y:number,width:number,height:number}}){
-  const aspect=Math.max(.45,Math.min(3.2,rect.width/rect.height))
-  return <div className="cropViewport" style={{aspectRatio:`${aspect}`}}><img src={imageUrl} alt="탐지 영역" style={{width:`${100/rect.width}%`,height:`${100/rect.height}%`,left:`${-(rect.x/rect.width)*100}%`,top:`${-(rect.y/rect.height)*100}%`}}/></div>
-}
-function FullPagePreview({imageUrl,rect}:{imageUrl:string,rect:{x:number,y:number,width:number,height:number}|null}){
-  return <div className="pagePreview"><img src={imageUrl} alt="PDF 페이지"/>{rect&&<div className="detectedRect" style={{left:`${rect.x*100}%`,top:`${rect.y*100}%`,width:`${rect.width*100}%`,height:`${rect.height*100}%`}}><span>서명 후보</span></div>}</div>
+
+function SignaturePad({onChange}:{onChange:(data:string|null)=>void}){
+  const ref=useRef<HTMLCanvasElement>(null)
+  const drawing=useRef(false)
+  useEffect(()=>{
+    const c=ref.current!;const rect=c.getBoundingClientRect();const dpr=Math.min(2,window.devicePixelRatio||1)
+    c.width=Math.floor(rect.width*dpr);c.height=Math.floor(180*dpr)
+    const ctx=c.getContext('2d')!;ctx.scale(dpr,dpr);ctx.lineWidth=2.6;ctx.lineCap='round';ctx.lineJoin='round';ctx.strokeStyle='#111'
+  },[])
+  const pos=(e:React.PointerEvent<HTMLCanvasElement>)=>{const r=e.currentTarget.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top}}
+  return <section className="card" style={{marginTop:16}}>
+    <div className="cardHead"><div><p className="label">SIGNATURE PAD</p><h2>손가락으로 서명</h2></div><button className="ghost" onClick={()=>{const c=ref.current!;c.getContext('2d')!.clearRect(0,0,c.width,c.height);onChange(null)}}>다시 쓰기</button></div>
+    <canvas ref={ref} className="signaturePad"
+      onPointerDown={e=>{drawing.current=true;e.currentTarget.setPointerCapture(e.pointerId);const p=pos(e);const ctx=e.currentTarget.getContext('2d')!;ctx.beginPath();ctx.moveTo(p.x,p.y)}}
+      onPointerMove={e=>{if(!drawing.current)return;const p=pos(e);const ctx=e.currentTarget.getContext('2d')!;ctx.lineTo(p.x,p.y);ctx.stroke()}}
+      onPointerUp={e=>{drawing.current=false;onChange(e.currentTarget.toDataURL('image/png'))}}
+    />
+  </section>
 }
