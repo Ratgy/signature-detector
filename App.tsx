@@ -5,946 +5,546 @@ import {
   useState
 } from 'react'
 
+import {assessTokens} from './detection'
+import {recognizePage,terminateOCR} from './ocr'
 import {
-  detectTarget
-} from './detection'
-
-import {
-  recognizeContactSheet,
-  terminateOCR
-} from './ocr'
-
-import {
-  buildContactSheet,
-  buildStrips,
+  buildFallbackRegions,
+  buildFallbackSheet,
+  cropPage,
+  expandRectByPixels,
   loadSource,
-  renderFinalCrop,
+  mapLocalRectToPage,
+  preprocess,
   renderPage,
   tokensForMeta
 } from './source'
 
 import type {
   FileResult,
+  OCRToken,
+  Rect,
   TargetCandidate
 } from './types'
 
-const VERSION='14.0'
+const VERSION='15.0'
 const BUILD='2026-08-13'
 
-const makeId=()=>
-  Math.random()
-    .toString(36)
-    .slice(2)
+const makeId=()=>Math.random().toString(36).slice(2)
 
-const emptyResult=(
-  file:File
-):FileResult=>({
+const emptyResult=(file:File):FileResult=>({
   id:makeId(),
   fileName:file.name,
   fileType:
-    file.type==='application/pdf'||
-    file.name.toLowerCase().endsWith('.pdf')
-      ?'pdf'
-      :'image',
+    file.type==='application/pdf'||file.name.toLowerCase().endsWith('.pdf')
+      ?'pdf':'image',
   status:'queued',
   progress:0,
   message:'대기 중',
   pageCount:0,
+  pageIndex:null,
   confidence:0,
+  pagePreview:null,
   cropPreview:null,
+  targetRect:null,
+  cropRect:null,
   elapsedMs:0
 })
 
 export default function App(){
-  const [files,setFiles]=
-    useState<File[]>([])
+  const [files,setFiles]=useState<File[]>([])
+  const [results,setResults]=useState<FileResult[]>([])
+  const [processing,setProcessing]=useState(false)
+  const inputRef=useRef<HTMLInputElement>(null)
+  const timers=useRef<Record<number,number>>({})
+  const ticks=useRef<Record<number,number>>({})
 
-  const [results,setResults]=
-    useState<FileResult[]>([])
+  useEffect(()=>()=>{terminateOCR()},[])
 
-  const [processing,setProcessing]=
-    useState(false)
-
-  const inputRef=
-    useRef<HTMLInputElement>(null)
-
-  const progressTimers=
-    useRef<Record<number,number>>({})
-
-  const progressTicks=
-    useRef<Record<number,number>>({})
-
-  useEffect(
-    ()=>()=>{
-      terminateOCR()
-    },
-    []
-  )
-
-  // v14 핵심:
-  // progress는 어떤 경로에서도 현재 값보다 작아질 수 없다.
-  function update(
-    index:number,
-    patch:Partial<FileResult>
-  ){
-    setResults(prev=>
-      prev.map((result,i)=>{
-        if(i!==index){
-          return result
-        }
-
-        const next={
-          ...result,
-          ...patch
-        }
-
-        if(
-          patch.progress!==undefined
-        ){
-          next.progress=
-            Math.max(
-              result.progress,
-              Math.min(
-                100,
-                patch.progress
-              )
-            )
-        }
-
-        return next
-      })
-    )
+  // 절대 감소하지 않는 progress 업데이트.
+  function update(index:number,patch:Partial<FileResult>){
+    setResults(prev=>prev.map((result,i)=>{
+      if(i!==index)return result
+      const next={...result,...patch}
+      if(patch.progress!==undefined){
+        next.progress=Math.max(
+          result.progress,
+          Math.min(100,Math.round(patch.progress))
+        )
+      }
+      return next
+    }))
   }
 
-  function stopProgress(
-    index:number
-  ){
-    const id=
-      progressTimers.current[index]
-
+  function stopProgress(index:number){
+    const id=timers.current[index]
     if(id){
       clearInterval(id)
-      delete progressTimers.current[index]
-      delete progressTicks.current[index]
+      delete timers.current[index]
+      delete ticks.current[index]
     }
   }
 
-  function startProgress(
-    index:number
-  ){
+  function startProgress(index:number){
     stopProgress(index)
-
-    progressTicks.current[index]=0
-
-    progressTimers.current[index]=
-      window.setInterval(()=>{
-        progressTicks.current[index]=
-          (
-            progressTicks.current[index]||
-            0
-          )+1
-
-        const tick=
-          progressTicks.current[index]
-
-        setResults(prev=>
-          prev.map((result,i)=>{
-            if(
-              i!==index||
-              result.status!=='processing'
-            ){
-              return result
-            }
-
-            if(result.progress>=97){
-              return result
-            }
-
-            // 초반에는 빠르게, 후반에는 천천히.
-            // 긴 OCR에서도 97%에 너무 빨리 도달해 멈춰 보이지 않게 한다.
-            const shouldMove=
-              result.progress<60
-                ?true
-                :result.progress<85
-                  ?tick%3===0
-                  :tick%8===0
-
-            if(!shouldMove){
-              return result
-            }
-
-            return{
-              ...result,
-              progress:
-                Math.min(
-                  97,
-                  result.progress+1
-                )
-            }
-          })
-        )
-      },140)
+    ticks.current[index]=0
+    timers.current[index]=window.setInterval(()=>{
+      ticks.current[index]=(ticks.current[index]??0)+1
+      const tick=ticks.current[index]
+      setResults(prev=>prev.map((r,i)=>{
+        if(i!==index||r.status!=='processing'||r.progress>=96)return r
+        const move=
+          r.progress<55||
+          (r.progress<82&&tick%3===0)||
+          (r.progress>=82&&tick%8===0)
+        return move?{...r,progress:r.progress+1}:r
+      }))
+    },130)
   }
 
-  function bestFromContact(
-    contactTokens:
-      Awaited<
-        ReturnType<
-          typeof recognizeContactSheet
-        >
-      >,
-    sheet:
-      HTMLCanvasElement,
-    metas:
-      ReturnType<
-        typeof buildContactSheet
-      >['metas']
-  ){
-    let best:
-      TargetCandidate|null=null
-
-    for(const meta of metas){
-      const localTokens=
-        tokensForMeta(
-          contactTokens,
-          sheet,
-          meta
-        )
-
-      const target=
-        detectTarget(
-          localTokens,
-          meta.strip.pageIndex,
-          meta.strip.rect
-        )
-
-      if(
-        target &&
-        (
-          !best ||
-          target.score>best.score
-        )
-      ){
-        best=target
-      }
-    }
-
-    return best
-  }
-
-  async function scanPage(
-    src:
-      Awaited<
-        ReturnType<
-          typeof loadSource
-        >
-      >,
+  async function firstPass(
+    page:HTMLCanvasElement,
     pageIndex:number,
-    mode:'gray'|'adaptive',
-    splitWide:boolean,
     index:number,
     pageNumber:number,
     pageCount:number
   ){
-    const page=
-      await renderPage(
-        src,
-        pageIndex,
-        src.type==='image'
-          ?2100
-          :1750
-      )
-
-    const strips=
-      buildStrips(
-        page,
-        pageIndex,
-        splitWide
-      )
-
-    const contact=
-      buildContactSheet(
-        page,
-        strips,
-        mode,
-        mode==='gray'
-          ?1080
-          :1240
-      )
-
-    const tokens=
-      await recognizeContactSheet(
-        contact.canvas,
-        pageIndex,
-        p=>{
-          const base=
-            mode==='gray'
-              ?18
-              :72
-
-          const span=
-            mode==='gray'
-              ?46
-              :20
-
-          const pageShare=
-            span/
-            Math.max(
-              1,
-              pageCount
-            )
-
-          update(
-            index,
-            {
-              progress:
-                base+
-                (
-                  pageNumber-1+
-                  p
-                )*
-                pageShare,
-              message:
-                mode==='gray'
-                  ?'서명영역 판독 중'
-                  :'스캔 보정 판독 중'
-            }
-          )
-        }
-      )
-
-    return bestFromContact(
-      tokens,
-      contact.canvas,
-      contact.metas
+    const processed=preprocess(page,'gray')
+    const tokens=await recognizePage(
+      processed,
+      pageIndex,
+      p=>update(index,{
+        progress:12+((pageNumber-1+p)/Math.max(1,pageCount))*45,
+        message:`${pageNumber}/${pageCount} 페이지 판독 중`
+      }),
+      false
     )
+    return assessTokens(tokens,pageIndex)
   }
 
-  async function processOne(
-    file:File,
+  async function fallbackPass(
+    page:HTMLCanvasElement,
+    pageIndex:number,
     index:number
   ){
-    const started=
-      performance.now()
-
-    update(
-      index,
-      {
-        status:'processing',
-        progress:1,
-        message:'문서 준비 중'
-      }
+    const regions=buildFallbackRegions(page,pageIndex)
+    const contact=buildFallbackSheet(page,regions,'adaptive')
+    const tokens=await recognizePage(
+      contact.canvas,
+      pageIndex,
+      p=>update(index,{
+        progress:62+p*27,
+        message:'저화질 스캔 보정 판독 중'
+      }),
+      true
     )
 
+    let best:TargetCandidate|null=null
+    let hint=0
+
+    for(const meta of contact.metas){
+      const local=tokensForMeta(tokens,contact.canvas,meta)
+      const assessment=assessTokens(local,pageIndex)
+      hint=Math.max(hint,assessment.hintScore)
+      if(assessment.target){
+        const mapped={
+          ...assessment.target,
+          targetRect:mapLocalRectToPage(
+            assessment.target.targetRect,
+            meta.region.rect
+          )
+        }
+        if(!best||mapped.score>best.score)best=mapped
+      }
+    }
+
+    return{target:best,hintScore:hint}
+  }
+
+  async function processOne(file:File,index:number){
+    const started=performance.now()
+    update(index,{status:'processing',progress:1,message:'문서 준비 중'})
     startProgress(index)
 
-    const src=
-      await loadSource(file)
+    const src=await loadSource(file)
+    update(index,{pageCount:src.pageCount,progress:7,message:'서명영역 탐색 중'})
 
-    update(
-      index,
-      {
-        pageCount:src.pageCount,
-        progress:8,
-        message:'스캔 페이지 확인 중'
-      }
-    )
+    let best:TargetCandidate|null=null
+    const pageHints:{pageIndex:number;hint:number}[]=[]
+    const pageCache=new Map<number,HTMLCanvasElement>()
 
-    // 중요:
-    // 스캔 PDF에 부정확한 hidden OCR text layer가 있어도
-    // v14에서는 사용하지 않는다.
-    // PDF/JPG/PNG 모두 같은 이미지 기반 파이프라인을 탄다.
+    // 1차: 페이지당 OCR 딱 한 번. 기존 contact-sheet 4~8배 중복 OCR 제거.
+    for(let pageIndex=0;pageIndex<src.pageCount;pageIndex++){
+      const page=await renderPage(
+        src,
+        pageIndex,
+        src.type==='image'?1900:1600
+      )
+      pageCache.set(pageIndex,page)
 
-    let best:
-      TargetCandidate|null=null
+      const assessment=await firstPass(
+        page,pageIndex,index,pageIndex+1,src.pageCount
+      )
+      pageHints.push({pageIndex,hint:assessment.hintScore})
 
-    // PASS 1
-    // 모든 위치를 상/중/하 가정 없이 4개 겹침 strip으로 커버.
-    for(
-      let pageIndex=0;
-      pageIndex<src.pageCount;
-      pageIndex++
-    ){
-      const target=
-        await scanPage(
-          src,
-          pageIndex,
-          'gray',
-          true,
-          index,
-          pageIndex+1,
-          src.pageCount
-        )
-
-      if(
-        target &&
-        (
-          !best ||
-          target.score>best.score
-        )
-      ){
-        best=target
+      if(assessment.target&&(!best||assessment.target.score>best.score)){
+        best=assessment.target
       }
 
-      // 엄격한 완성 패턴만 0.90 이상에 도달한다.
-      // 이 경우 다른 페이지까지 읽지 않고 즉시 종료.
-      if(
-        target &&
-        target.confidence>=.90
-      ){
-        best=target
+      if(assessment.target&&assessment.target.confidence>=.82){
+        best=assessment.target
         break
       }
     }
 
-    // 가로가 긴 단일 landscape 문서를
-    // 좌/우로 나눈 탓에 못 찾은 경우:
-    // 같은 문서를 전체 폭 strip으로 한 번만 재검사.
-    if(
-      !best ||
-      best.confidence<.66
-    ){
-      for(
-        let pageIndex=0;
-        pageIndex<src.pageCount;
-        pageIndex++
-      ){
-        const target=
-          await scanPage(
-            src,
-            pageIndex,
-            'gray',
-            false,
-            index,
-            pageIndex+1,
-            src.pageCount
-          )
+    // 2차는 1차 실패 때만. 가장 가능성 높은 최대 2개 페이지만 확대 분할 OCR 1회.
+    if(!best||best.confidence<.72){
+      const candidates=[...pageHints]
+        .sort((a,b)=>b.hint-a.hint)
+        .slice(0,Math.min(2,src.pageCount))
 
-        if(
-          target &&
-          (
-            !best ||
-            target.score>best.score
-          )
-        ){
-          best=target
+      for(const candidate of candidates){
+        const page=pageCache.get(candidate.pageIndex)??await renderPage(
+          src,candidate.pageIndex,src.type==='image'?2100:1750
+        )
+        pageCache.set(candidate.pageIndex,page)
+
+        const assessment=await fallbackPass(page,candidate.pageIndex,index)
+        if(assessment.target&&(!best||assessment.target.score>best.score)){
+          best=assessment.target
         }
-
-        if(
-          target &&
-          target.confidence>=.90
-        ){
-          best=target
+        if(assessment.target&&assessment.target.confidence>=.78){
+          best=assessment.target
           break
         }
       }
     }
 
-    // PASS 2
-    // 완전한 blank date + buyer 구조가 아직 없을 때만
-    // 촬영/스캔 얼룩 보정 adaptive OCR.
-    if(
-      !best ||
-      best.confidence<.66
-    ){
-      for(
-        let pageIndex=0;
-        pageIndex<src.pageCount;
-        pageIndex++
-      ){
-        const target=
-          await scanPage(
-            src,
-            pageIndex,
-            'adaptive',
-            true,
-            index,
-            pageIndex+1,
-            src.pageCount
-          )
-
-        if(
-          target &&
-          (
-            !best ||
-            target.score>best.score
-          )
-        ){
-          best=target
-        }
-
-        if(
-          target &&
-          target.confidence>=.86
-        ){
-          best=target
-          break
-        }
-      }
-    }
-
-    if(
-      !best ||
-      best.confidence<.60
-    ){
+    if(!best||best.confidence<.68){
       stopProgress(index)
-
-      update(
-        index,
-        {
-          status:'failed',
-          progress:100,
-          message:
-            '서명영역을 찾지 못했습니다.',
-          elapsedMs:
-            performance.now()-
-            started
-        }
-      )
-
+      update(index,{
+        status:'failed',
+        progress:100,
+        message:'서명영역을 찾지 못했습니다.',
+        elapsedMs:performance.now()-started
+      })
       return
     }
 
-    update(
-      index,
-      {
-        progress:94,
-        message:'서명영역 확대 중'
-      }
-    )
+    update(index,{progress:92,message:'서명영역 확대 중'})
 
-    const crop=
-      await renderFinalCrop(
-        src,
-        best.pageIndex,
-        best.targetRect,
-        40
-      )
+    // 결과/편집용은 원본 톤으로 다시 렌더. 같은 좌표를 원본과 확대본이 공유한다.
+    const finalPage=await renderPage(src,best.pageIndex,1800)
+    const cropRect=expandRectByPixels(finalPage,best.targetRect,40)
+    const crop=cropPage(finalPage,cropRect,1600)
 
     stopProgress(index)
-
-    update(
-      index,
-      {
-        status:'success',
-        progress:100,
-        message:'완료',
-        confidence:
-          best.confidence,
-        cropPreview:
-          crop.toDataURL(
-            'image/jpeg',
-            .98
-          ),
-        elapsedMs:
-          performance.now()-
-          started
-      }
-    )
+    update(index,{
+      status:'success',
+      progress:100,
+      message:'완료',
+      pageIndex:best.pageIndex,
+      confidence:best.confidence,
+      pagePreview:finalPage.toDataURL('image/jpeg',.93),
+      cropPreview:crop.toDataURL('image/jpeg',.98),
+      targetRect:best.targetRect,
+      cropRect,
+      elapsedMs:performance.now()-started
+    })
   }
 
   async function start(){
-    if(
-      !files.length||
-      processing
-    ){
-      return
-    }
-
+    if(!files.length||processing)return
     setProcessing(true)
-    setResults(
-      files.map(emptyResult)
-    )
+    setResults(files.map(emptyResult))
 
-    for(
-      let i=0;
-      i<files.length;
-      i++
-    ){
+    for(let i=0;i<files.length;i++){
       try{
-        await processOne(
-          files[i],
-          i
-        )
+        await processOne(files[i],i)
       }catch(error){
         stopProgress(i)
-
-        update(
-          i,
-          {
-            status:'failed',
-            progress:100,
-            message:
-              `오류: ${
-                error instanceof Error
-                  ?error.message
-                  :String(error)
-              }`
-          }
-        )
+        update(i,{
+          status:'failed',
+          progress:100,
+          message:`오류: ${error instanceof Error?error.message:String(error)}`
+        })
       }
     }
 
     setProcessing(false)
   }
 
-  function selectFiles(
-    list:FileList|null
-  ){
-    if(!list){
-      return
-    }
-
-    const selected=
-      Array.from(list)
-        .filter(file=>{
-          const name=
-            file.name
-              .toLowerCase()
-
-          return(
-            file.type===
-              'application/pdf'||
-            file.type===
-              'image/jpeg'||
-            file.type===
-              'image/png'||
-            name.endsWith('.pdf')||
-            name.endsWith('.jpg')||
-            name.endsWith('.jpeg')||
-            name.endsWith('.png')
-          )
-        })
-        .slice(0,5)
-
+  function selectFiles(list:FileList|null){
+    if(!list)return
+    const selected=Array.from(list)
+      .filter(file=>{
+        const name=file.name.toLowerCase()
+        return file.type==='application/pdf'||
+          file.type==='image/jpeg'||
+          file.type==='image/png'||
+          name.endsWith('.pdf')||
+          name.endsWith('.jpg')||
+          name.endsWith('.jpeg')||
+          name.endsWith('.png')
+      })
+      .slice(0,5)
     setFiles(selected)
     setResults([])
   }
 
-  function judge(
-    index:number,
-    judgement:
-      FileResult['judgement']
-  ){
-    update(
-      index,
-      {judgement}
-    )
+  function judge(index:number,judgement:FileResult['judgement']){
+    update(index,{judgement})
   }
 
   const stats=useMemo(()=>{
-    const judged=
-      results.filter(
-        result=>result.judgement
-      )
-
-    const correct=
-      judged.filter(
-        result=>
-          result.judgement===
-          'correct'
-      ).length
-
-    const partial=
-      judged.filter(
-        result=>
-          result.judgement===
-          'partial'
-      ).length
-
-    const total=
-      judged.length
-
+    const judged=results.filter(r=>r.judgement)
+    const exact=judged.filter(r=>r.judgement==='correct').length
+    const partial=judged.filter(r=>r.judgement==='partial').length
     return{
-      total,
-      exact:
-        total
-          ?Math.round(
-            correct/
-            total*
-            100
-          )
-          :0,
-      usable:
-        total
-          ?Math.round(
-            (
-              correct+
-              partial
-            )/
-            total*
-            100
-          )
-          :0
+      total:judged.length,
+      exact:judged.length?Math.round(exact/judged.length*100):0,
+      usable:judged.length?Math.round((exact+partial)/judged.length*100):0
     }
   },[results])
 
-  return(
-    <div className="app">
-      <header>
-        <p className="eyebrow">
-          SCAN-FIRST · STRICT BLANK SIGNING ROW
-        </p>
-
-        <h1>
-          서명영역 탐지 검수 v{VERSION}
-        </h1>
-
-        <div className="versionBadge">
-          BUILD {VERSION} · {BUILD}
-        </div>
-
+  return <div className="app">
+    <header>
+      <div>
+        <p className="eyebrow">SCAN DETECTION · LINKED SIGNATURE EDITOR</p>
+        <h1>서명영역 탐지 v{VERSION}</h1>
+        <div className="versionBadge">BUILD {VERSION} · {BUILD}</div>
         <p className="sub">
-          숫자가 없는 년·월·일과
-          매수인·서명 영역만 찾아 확대합니다.
+          원본에서 서명영역을 찾고, 확대된 같은 영역에 쓴 획을 원본에도 실시간 반영합니다.
         </p>
-      </header>
+      </div>
+    </header>
 
-      <section
-        className={
-          `dropzone ${
-            processing
-              ?'disabled'
-              :''
-          }`
-        }
-        onClick={()=>
-          !processing &&
-          inputRef.current?.click()
-        }
-      >
-        <input
-          ref={inputRef}
-          type="file"
-          multiple
-          accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"
-          hidden
-          onChange={(event:any)=>
-            selectFiles(
-              event.target.files
-            )
-          }
+    <section
+      className={`dropzone ${processing?'disabled':''}`}
+      onClick={()=>!processing&&inputRef.current?.click()}
+    >
+      <input
+        ref={inputRef}
+        type="file"
+        multiple
+        accept="application/pdf,image/jpeg,image/png,.pdf,.jpg,.jpeg,.png"
+        hidden
+        onChange={e=>selectFiles(e.target.files)}
+      />
+      <div className="uploadIcon">5</div>
+      <strong>{files.length?`${files.length}개 파일 선택됨`:'PDF / JPG / PNG 최대 5개'}</strong>
+      <span>스캔본에서 비어 있는 날짜·매수인·서명 영역을 찾습니다.</span>
+    </section>
+
+    {files.length>0&&<section className="batchList">
+      {files.map((f,i)=><div className="fileChip" key={`${f.name}-${i}`}>
+        <b>{i+1}</b><span>{f.name}</span>
+      </div>)}
+      <button className="startBtn" disabled={processing} onClick={start}>
+        {processing?'분석 중…':'분석 시작'}
+      </button>
+    </section>}
+
+    {results.map((r,i)=><section className="resultCard card" key={r.id}>
+      <div className="resultTop">
+        <div><p className="label">FILE {i+1}</p><h2>{r.fileName}</h2></div>
+        {r.status==='success'&&<span className="successBadge">{Math.round(r.confidence*100)}%</span>}
+      </div>
+
+      {r.status==='processing'&&<>
+        <div className="statusTop"><strong>{r.message}</strong><span className="bigPercent">{r.progress}%</span></div>
+        <div className="progress"><i style={{width:`${r.progress}%`}}/></div>
+      </>}
+
+      {r.status==='success'&&r.pagePreview&&r.cropPreview&&r.targetRect&&r.cropRect&&
+        <LinkedSignatureEditor
+          pageImage={r.pagePreview}
+          cropImage={r.cropPreview}
+          targetRect={r.targetRect}
+          cropRect={r.cropRect}
         />
-
-        <div className="uploadIcon">
-          5
-        </div>
-
-        <strong>
-          {
-            files.length
-              ?`${files.length}개 파일 선택됨`
-              :'PDF / JPG / PNG 최대 5개'
-          }
-        </strong>
-
-        <span>
-          스캔본에서도 동일한 방식으로 서명란을 찾습니다.
-        </span>
-      </section>
-
-      {
-        files.length>0 &&
-        <section className="batchList">
-          {
-            files.map(
-              (file,i)=>
-                <div
-                  className="fileChip"
-                  key={`${file.name}-${i}`}
-                >
-                  <b>{i+1}</b>
-                  <span>
-                    {file.name}
-                  </span>
-                </div>
-            )
-          }
-
-          <button
-            className="startBtn"
-            disabled={processing}
-            onClick={start}
-          >
-            {
-              processing
-                ?'분석 중…'
-                :'분석 시작'
-            }
-          </button>
-        </section>
       }
 
-      {
-        results.map(
-          (result,i)=>
-            <section
-              className="resultCard card"
-              key={result.id}
-            >
-              <div className="resultTop">
-                <div>
-                  <p className="label">
-                    FILE {i+1}
-                  </p>
+      {r.status==='failed'&&<div className="failureText">서명영역을 찾지 못했습니다.</div>}
 
-                  <h2>
-                    {result.fileName}
-                  </h2>
-                </div>
+      {r.status==='success'&&<div className="judgeButtons">
+        <button className={r.judgement==='correct'?'selected':''} onClick={()=>judge(i,'correct')}>정확함</button>
+        <button className={r.judgement==='partial'?'selected':''} onClick={()=>judge(i,'partial')}>일부 포함</button>
+        <button className={r.judgement==='wrong'?'selected':''} onClick={()=>judge(i,'wrong')}>틀림</button>
+      </div>}
+    </section>)}
 
-                {
-                  result.status===
-                    'success' &&
-                  <span className="successBadge">
-                    {
-                      Math.round(
-                        result.confidence*
-                        100
-                      )
-                    }%
-                  </span>
-                }
-              </div>
+    {stats.total>0&&<section className="stats compactStats">
+      <div><span>평가</span><strong>{stats.total}</strong></div>
+      <div><span>Exact</span><strong>{stats.exact}%</strong></div>
+      <div><span>Usable</span><strong>{stats.usable}%</strong></div>
+    </section>}
+  </div>
+}
 
-              {
-                result.status===
-                  'processing' &&
-                <>
-                  <div className="statusTop">
-                    <strong>
-                      {result.message}
-                    </strong>
+type Point={x:number;y:number}
+type Stroke=Point[]
 
-                    <span className="bigPercent">
-                      {result.progress}%
-                    </span>
-                  </div>
+function LinkedSignatureEditor({
+  pageImage,
+  cropImage,
+  targetRect,
+  cropRect
+}:{
+  pageImage:string
+  cropImage:string
+  targetRect:Rect
+  cropRect:Rect
+}){
+  const pageCanvas=useRef<HTMLCanvasElement>(null)
+  const cropCanvas=useRef<HTMLCanvasElement>(null)
+  const pageImg=useRef<HTMLImageElement|null>(null)
+  const cropImg=useRef<HTMLImageElement|null>(null)
+  const [strokes,setStrokes]=useState<Stroke[]>([])
+  const active=useRef<Stroke|null>(null)
 
-                  <div className="progress">
-                    <i
-                      style={{
-                        width:
-                          `${result.progress}%`
-                      }}
-                    />
-                  </div>
-                </>
-              }
+  function fitCanvas(canvas:HTMLCanvasElement,img:HTMLImageElement,maxDpr=2){
+    const cssWidth=canvas.clientWidth||320
+    const ratio=img.naturalHeight/img.naturalWidth
+    const dpr=Math.min(maxDpr,window.devicePixelRatio||1)
+    canvas.width=Math.max(1,Math.round(cssWidth*dpr))
+    canvas.height=Math.max(1,Math.round(cssWidth*ratio*dpr))
+  }
 
-              {
-                result.cropPreview &&
-                <div className="signatureOnly">
-                  <div className="signatureHeader">
-                    <h3>
-                      서명영역
-                    </h3>
-                  </div>
+  function drawStroke(
+    ctx:CanvasRenderingContext2D,
+    stroke:Stroke,
+    width:number,
+    height:number,
+    lineWidth:number
+  ){
+    if(stroke.length<1)return
+    ctx.beginPath()
+    ctx.moveTo(stroke[0].x*width,stroke[0].y*height)
+    for(const p of stroke.slice(1))ctx.lineTo(p.x*width,p.y*height)
+    ctx.strokeStyle='#111'
+    ctx.lineWidth=lineWidth
+    ctx.lineCap='round'
+    ctx.lineJoin='round'
+    ctx.stroke()
+  }
 
-                  <div className="signatureCrop v14Crop">
-                    <img
-                      src={
-                        result.cropPreview
-                      }
-                      alt="탐지된 서명영역"
-                    />
-                  </div>
-                </div>
-              }
+  function redraw(){
+    const pc=pageCanvas.current
+    const cc=cropCanvas.current
+    const pi=pageImg.current
+    const ci=cropImg.current
+    if(!pc||!cc||!pi||!ci)return
 
-              {
-                result.status===
-                  'failed' &&
-                <div className="failureText">
-                  서명영역을 찾지 못했습니다.
-                </div>
-              }
+    const pctx=pc.getContext('2d')!
+    pctx.clearRect(0,0,pc.width,pc.height)
+    pctx.drawImage(pi,0,0,pc.width,pc.height)
 
-              {
-                result.status===
-                  'success' &&
-                <div className="judgeButtons">
-                  <button
-                    className={
-                      result.judgement===
-                        'correct'
-                        ?'selected'
-                        :''
-                    }
-                    onClick={()=>
-                      judge(
-                        i,
-                        'correct'
-                      )
-                    }
-                  >
-                    정확함
-                  </button>
+    // 원본 사진에서 실제 서명영역을 노란 테두리로 표시.
+    pctx.save()
+    pctx.strokeStyle='#FAC729'
+    pctx.lineWidth=Math.max(4,pc.width*.004)
+    pctx.strokeRect(
+      targetRect.x*pc.width,
+      targetRect.y*pc.height,
+      targetRect.width*pc.width,
+      targetRect.height*pc.height
+    )
+    pctx.restore()
 
-                  <button
-                    className={
-                      result.judgement===
-                        'partial'
-                        ?'selected'
-                        :''
-                    }
-                    onClick={()=>
-                      judge(
-                        i,
-                        'partial'
-                      )
-                    }
-                  >
-                    일부 포함
-                  </button>
+    const cctx=cc.getContext('2d')!
+    cctx.clearRect(0,0,cc.width,cc.height)
+    cctx.drawImage(ci,0,0,cc.width,cc.height)
 
-                  <button
-                    className={
-                      result.judgement===
-                        'wrong'
-                        ?'selected'
-                        :''
-                    }
-                    onClick={()=>
-                      judge(
-                        i,
-                        'wrong'
-                      )
-                    }
-                  >
-                    틀림
-                  </button>
-                </div>
-              }
-            </section>
-        )
-      }
+    for(const stroke of strokes){
+      drawStroke(cctx,stroke,cc.width,cc.height,Math.max(3,cc.width*.005))
 
-      {
-        stats.total>0 &&
-        <section className="stats compactStats">
-          <div>
-            <span>평가</span>
-            <strong>
-              {stats.total}
-            </strong>
-          </div>
+      // 확대 crop 좌표를 원본 page 좌표로 역매핑.
+      const pageStroke=stroke.map(p=>({
+        x:cropRect.x+p.x*cropRect.width,
+        y:cropRect.y+p.y*cropRect.height
+      }))
+      drawStroke(pctx,pageStroke,pc.width,pc.height,Math.max(2,pc.width*.0025))
+    }
+  }
 
-          <div>
-            <span>Exact</span>
-            <strong>
-              {stats.exact}%
-            </strong>
-          </div>
+  useEffect(()=>{
+    let count=0
+    const ready=()=>{
+      count++
+      if(count<2)return
+      const pc=pageCanvas.current!,cc=cropCanvas.current!
+      fitCanvas(pc,pageImg.current!)
+      fitCanvas(cc,cropImg.current!)
+      redraw()
+    }
 
-          <div>
-            <span>Usable</span>
-            <strong>
-              {stats.usable}%
-            </strong>
-          </div>
-        </section>
-      }
+    const p=new Image()
+    p.onload=ready
+    p.src=pageImage
+    pageImg.current=p
+
+    const c=new Image()
+    c.onload=ready
+    c.src=cropImage
+    cropImg.current=c
+  },[pageImage,cropImage])
+
+  useEffect(()=>{redraw()},[strokes])
+
+  useEffect(()=>{
+    const onResize=()=>{
+      if(!pageCanvas.current||!cropCanvas.current||!pageImg.current||!cropImg.current)return
+      fitCanvas(pageCanvas.current,pageImg.current)
+      fitCanvas(cropCanvas.current,cropImg.current)
+      redraw()
+    }
+    window.addEventListener('resize',onResize)
+    return()=>window.removeEventListener('resize',onResize)
+  },[strokes])
+
+  function point(e:React.PointerEvent<HTMLCanvasElement>):Point{
+    const r=e.currentTarget.getBoundingClientRect()
+    return{
+      x:Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)),
+      y:Math.max(0,Math.min(1,(e.clientY-r.top)/r.height))
+    }
+  }
+
+  return <div className="linkedEditor">
+    <div className="editorSection">
+      <div className="editorTitle"><h3>원본</h3><span>노란 테두리가 탐지된 서명영역입니다.</span></div>
+      <div className="originalCanvasWrap"><canvas ref={pageCanvas}/></div>
     </div>
-  )
+
+    <div className="editorSection signatureEditorFill">
+      <div className="editorTitle"><h3>서명영역</h3><span>확대된 원본 위에 직접 작성하세요.</span></div>
+      <div className="signatureCanvasWrap">
+        <canvas
+          ref={cropCanvas}
+          onPointerDown={e=>{
+            e.currentTarget.setPointerCapture(e.pointerId)
+            const s=[point(e)]
+            active.current=s
+            setStrokes(prev=>[...prev,s])
+          }}
+          onPointerMove={e=>{
+            if(!active.current)return
+            const p=point(e)
+            active.current.push(p)
+            setStrokes(prev=>{
+              const copy=[...prev]
+              copy[copy.length-1]=[...active.current!]
+              return copy
+            })
+          }}
+          onPointerUp={()=>{active.current=null}}
+          onPointerCancel={()=>{active.current=null}}
+        />
+      </div>
+      <div className="editorActions">
+        <span>이곳에 쓴 내용은 위 원본의 같은 위치에도 반영됩니다.</span>
+        <button onClick={()=>setStrokes([])}>작성 초기화</button>
+      </div>
+    </div>
+  </div>
 }

@@ -66,3 +66,28 @@
   max-height:640px;
   object-fit:contain;
 }
+
+/* v15 linked original ↔ enlarged signature editor */
+.linkedEditor{margin-top:22px;display:flex;flex-direction:column;gap:24px}
+.editorSection{min-width:0}
+.editorTitle{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:10px}
+.editorTitle h3{margin:0;font-size:24px;letter-spacing:-.035em}
+.editorTitle span{font-size:12px;color:#777;text-align:right}
+.originalCanvasWrap,.signatureCanvasWrap{width:100%;overflow:hidden;border-radius:14px;background:#f1f1f1;border:1px solid #e1e1e1}
+.originalCanvasWrap canvas,.signatureCanvasWrap canvas{display:block;width:100%;height:auto}
+.signatureCanvasWrap{background:#fff;border:2px solid #FAC729;box-shadow:0 8px 24px rgba(0,0,0,.06)}
+.signatureCanvasWrap canvas{touch-action:none;cursor:crosshair}
+.editorActions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px}
+.editorActions span{font-size:12px;color:#777;line-height:1.45}
+.editorActions button{flex:none;height:40px;padding:0 12px;border:1px solid #ddd;border-radius:10px;background:#fff;font-size:12px;font-weight:800}
+
+@media(max-width:600px){
+  .app{padding-left:20px;padding-right:20px}
+  .resultCard{padding:20px}
+  /* card padding을 상쇄해 viewport 기준 좌우 20px까지 확대영역을 fill */
+  .signatureEditorFill{margin-left:-20px;margin-right:-20px}
+  .signatureEditorFill .editorTitle,.signatureEditorFill .editorActions{padding-left:20px;padding-right:20px}
+  .signatureEditorFill .signatureCanvasWrap{border-left-width:0;border-right-width:0;border-radius:0}
+  .editorTitle{align-items:flex-start;flex-direction:column;gap:4px}
+  .editorTitle span{text-align:left}
+}

@@ -12,11 +12,10 @@ export interface OCRToken {
   pageIndex:number
 }
 
-export interface StripSpec {
+export interface RegionSpec {
   id:string
   pageIndex:number
   rect:Rect
-  panelId:string
 }
 
 export interface TargetCandidate {
@@ -24,6 +23,12 @@ export interface TargetCandidate {
   targetRect:Rect
   score:number
   confidence:number
+  mode:'exact'|'confirm-date'|'buyer-sign'
+}
+
+export interface ScanAssessment {
+  target:TargetCandidate|null
+  hintScore:number
 }
 
 export interface FileResult {
@@ -34,8 +39,12 @@ export interface FileResult {
   progress:number
   message:string
   pageCount:number
+  pageIndex:number|null
   confidence:number
+  pagePreview:string|null
   cropPreview:string|null
+  targetRect:Rect|null
+  cropRect:Rect|null
   elapsedMs:number
   judgement?:'correct'|'partial'|'wrong'
 }
