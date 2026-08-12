@@ -79,12 +79,16 @@ footer b { color: #333; }
 .primaryBtn{min-height:48px;padding:0 20px;border:0;border-radius:12px;background:#fac729;font-weight:800}
 .primaryBtn:disabled{opacity:.4}
 
-.modeTabs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
-.modeTabs button{height:44px;border:1px solid #ddd;background:#fff;border-radius:10px;font-weight:700}
-.modeTabs button.active{background:#191919;color:#fff;border-color:#191919}
+.bigPercent{font-size:22px;font-weight:900;color:#fac729;min-width:64px;text-align:right;font-variant-numeric:tabular-nums}
+.progressTicks{display:flex;justify-content:space-between;color:#777;font-size:10px;margin-top:7px}
+.toolTabs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.toolTabs button{height:46px;border:1px solid #ddd;background:#fff;border-radius:11px;font-weight:800}
+.toolTabs button.active{background:#191919;color:#fff;border-color:#191919}
 .annotationWrap{display:flex;flex-direction:column;gap:10px}
-.annotationCanvas{width:100%;height:auto;border:1px solid #dcdcdc;border-radius:12px;background:#fff;touch-action:none;display:block}
+.annotationCanvas{width:100%;height:auto;min-height:160px;border:1px solid #d9d9d9;border-radius:12px;background:#fff;touch-action:none;display:block}
 .dateInputRow{display:grid;grid-template-columns:1fr auto auto;gap:8px}
 .dateInputRow input{height:46px;border:1px solid #ddd;border-radius:10px;padding:0 12px;min-width:0}
 .dateInputRow button{height:46px;border:1px solid #ddd;border-radius:10px;background:#fff;padding:0 12px}
 .hint{color:#777;line-height:1.5}
+.primaryBtn{min-height:48px;padding:0 20px;border:0;border-radius:12px;background:#fac729;font-weight:900}
+.primaryBtn:disabled{opacity:.38}

@@ -3,10 +3,10 @@ import type { OCRToken } from './types'
 
 let workerPromise: ReturnType<typeof createWorker> | null = null
 
-async function getWorker(onProgress?: (p:number,status:string)=>void) {
+async function getWorker(onProgress?: (p: number, status: string) => void) {
   if (!workerPromise) {
     workerPromise = createWorker('kor+eng', undefined, {
-      logger: (m:any) => {
+      logger: (m: any) => {
         if (typeof m.progress === 'number') onProgress?.(m.progress, m.status ?? 'OCR')
       },
     })
@@ -14,29 +14,22 @@ async function getWorker(onProgress?: (p:number,status:string)=>void) {
   return workerPromise
 }
 
-// ultra-fast first pass: text only
+// Fast pass: text only. No block/word output because that adds measurable overhead.
 export async function recognizeTextFast(
   canvas: HTMLCanvasElement,
-  onProgress?: (p:number,status:string)=>void,
-) {
+  onProgress?: (p: number, status: string) => void,
+): Promise<{ text: string; confidence: number }> {
   const worker = await getWorker(onProgress)
-  const result:any = await worker.recognize(canvas)
+  const result: any = await worker.recognize(canvas)
   return {
     text: String(result.data?.text ?? ''),
     confidence: Number(result.data?.confidence ?? 0),
   }
 }
 
-// precise pass only for one small ROI
-export async function recognizeWordsPrecise(
-  canvas: HTMLCanvasElement,
-  pageIndex: number,
-  onProgress?: (p:number,status:string)=>void,
-): Promise<OCRToken[]> {
-  const worker = await getWorker(onProgress)
-  const result:any = await worker.recognize(canvas, {}, { blocks: true, text: true })
-  const words:any[] = []
-  for (const block of result.data?.blocks ?? []) {
+function wordsFromBlocks(blocks: any[] | null | undefined) {
+  const words: any[] = []
+  for (const block of blocks ?? []) {
     for (const paragraph of block.paragraphs ?? []) {
       for (const line of paragraph.lines ?? []) {
         for (const word of line.words ?? []) words.push(word)
@@ -44,8 +37,19 @@ export async function recognizeWordsPrecise(
     }
   }
   return words
-    .filter(w => w?.text?.trim() && w?.bbox)
-    .map(w => ({
+}
+
+// Precise pass: run only once on the selected page+rotation.
+export async function recognizeWordsPrecise(
+  canvas: HTMLCanvasElement,
+  pageIndex: number,
+  onProgress?: (p: number, status: string) => void,
+): Promise<OCRToken[]> {
+  const worker = await getWorker(onProgress)
+  const result: any = await worker.recognize(canvas, {}, { blocks: true, text: true })
+  return wordsFromBlocks(result.data?.blocks)
+    .filter((w: any) => w?.text?.trim() && w?.bbox)
+    .map((w: any) => ({
       text: String(w.text).trim(),
       confidence: Number(w.confidence ?? 0),
       pageIndex,

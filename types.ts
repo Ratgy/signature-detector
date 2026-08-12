@@ -14,21 +14,12 @@ export interface OCRToken {
   pageIndex: number
 }
 
-export interface SignatureTarget {
+export interface SignatureBlock {
   pageIndex: number
   rotation: Rotation
   rect: NormalizedRect
-  dateRect: NormalizedRect | null
-  signerRect: NormalizedRect | null
-  source: 'date-anchor' | 'buyer-anchor' | 'line-pair' | 'fallback'
+  rotatedRect: NormalizedRect
   confidence: number
-}
-
-export interface DetectionCandidate {
-  pageIndex: number
-  rotation: Rotation
   score: number
-  confidence: number
-  target: SignatureTarget | null
-  matchedTexts: string[]
+  matchedKeywords: string[]
 }
