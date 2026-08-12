@@ -14,6 +14,19 @@ async function getWorker(onProgress?: (p: number, status: string) => void) {
   return workerPromise
 }
 
+// Fast pass: text only. No block/word output because that adds measurable overhead.
+export async function recognizeTextFast(
+  canvas: HTMLCanvasElement,
+  onProgress?: (p: number, status: string) => void,
+): Promise<{ text: string; confidence: number }> {
+  const worker = await getWorker(onProgress)
+  const result: any = await worker.recognize(canvas)
+  return {
+    text: String(result.data?.text ?? ''),
+    confidence: Number(result.data?.confidence ?? 0),
+  }
+}
+
 function wordsFromBlocks(blocks: any[] | null | undefined) {
   const words: any[] = []
   for (const block of blocks ?? []) {
@@ -26,16 +39,15 @@ function wordsFromBlocks(blocks: any[] | null | undefined) {
   return words
 }
 
-export async function recognizeCanvas(
+// Precise pass: run only once on the selected page+rotation.
+export async function recognizeWordsPrecise(
   canvas: HTMLCanvasElement,
   pageIndex: number,
   onProgress?: (p: number, status: string) => void,
 ): Promise<OCRToken[]> {
   const worker = await getWorker(onProgress)
   const result: any = await worker.recognize(canvas, {}, { blocks: true, text: true })
-  const words = wordsFromBlocks(result.data?.blocks)
-
-  return words
+  return wordsFromBlocks(result.data?.blocks)
     .filter((w: any) => w?.text?.trim() && w?.bbox)
     .map((w: any) => ({
       text: String(w.text).trim(),
