@@ -55,13 +55,13 @@ export default function App(){
     startSmoothProgress(index)
 
     const src=await loadSource(file)
-    update(index,{pageCount:src.pageCount,progress:6,message:'서명 문맥이 있는 페이지 찾는 중'})
+    update(index,{pageCount:src.pageCount,progress:6,message:'매수인 서명 문맥이 있는 페이지 찾는 중'})
 
     let best:{pageIndex:number;score:number}|null=null
 
     // No rotation. Fast low-res full-page text scan first.
     for(let p=0;p<src.pageCount;p++){
-      const fastCanvas=preprocessCanvas(await renderSourcePage(src,p,700))
+      const fastCanvas=preprocessCanvas(await renderSourcePage(src,p,900))
       const fast=await recognizeTextFast(fastCanvas)
       const score=scoreFastPageText(fast.text)+fast.confidence*.04
       if(!best||score>best.score)best={pageIndex:p,score}
@@ -74,7 +74,7 @@ export default function App(){
     if(!best)throw new Error('후보 페이지를 찾지 못했습니다.')
 
     update(index,{progress:54,message:'선택된 페이지 정밀 OCR 중'})
-    const precise=preprocessCanvas(await renderSourcePage(src,best.pageIndex,1650))
+    const precise=preprocessCanvas(await renderSourcePage(src,best.pageIndex,2200))
     const tokens=await recognizeWordsPrecise(precise,best.pageIndex,(p,s)=>{
       update(index,{
         progress:Math.max(54,54+Math.round(p*30)),
