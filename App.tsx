@@ -1,17 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { detectSigningBlocks, scoreFastPageText } from './detection'
-import { recognizeTextFast, recognizeWordsPrecise, terminateOCR } from './ocr'
+import { detectTarget } from './detection'
+import { recognizeRegion, terminateOCR } from './ocr'
 import {
-  cropCanvasWithMargin,
-  cropNormalized,
-  getPdfNativeText,
+  buildSearchRegions,
+  filterTokensInRect,
+  getNativePdfTokens,
   loadSource,
-  preprocessCanvas,
-  renderSourcePage
+  preprocess,
+  remapTokens,
+  cropRegion,
+  renderFinalCrop,
+  renderPage
 } from './source'
-import type { FileResult, OCRToken } from './types'
+import type {
+  FileResult,
+  SearchRegion,
+  TargetCandidate
+} from './types'
 
-const VERSION='12.0'
+const VERSION='13.1'
 const BUILD='2026-08-12'
 
 const makeId=()=>Math.random().toString(36).slice(2)
@@ -27,26 +34,10 @@ const emptyResult=(file:File):FileResult=>({
   progress:0,
   message:'대기 중',
   pageCount:0,
-  pageIndex:null,
   confidence:0,
   cropPreview:null,
   elapsedMs:0
 })
-
-function remapTokens(
-  tokens:OCRToken[],
-  roi:{x:number;y:number;width:number;height:number}
-){
-  return tokens.map(t=>({
-    ...t,
-    rect:{
-      x:roi.x+t.rect.x*roi.width,
-      y:roi.y+t.rect.y*roi.height,
-      width:t.rect.width*roi.width,
-      height:t.rect.height*roi.height
-    }
-  }))
-}
 
 export default function App(){
   const [files,setFiles]=useState<File[]>([])
@@ -54,7 +45,7 @@ export default function App(){
   const [processing,setProcessing]=useState(false)
 
   const inputRef=useRef<HTMLInputElement>(null)
-  const timers=useRef<Record<number,number>>({})
+  const progressTimers=useRef<Record<number,number>>({})
 
   useEffect(()=>()=>{terminateOCR()},[])
 
@@ -64,225 +55,231 @@ export default function App(){
     ))
   }
 
-  const stopProgress=(index:number)=>{
-    const id=timers.current[index]
+  function stopProgress(index:number){
+    const id=progressTimers.current[index]
     if(id){
       clearInterval(id)
-      delete timers.current[index]
+      delete progressTimers.current[index]
     }
   }
 
-  const startProgress=(index:number)=>{
+  function startProgress(index:number){
     stopProgress(index)
 
-    timers.current[index]=window.setInterval(()=>{
+    progressTimers.current[index]=window.setInterval(()=>{
       setResults(prev=>prev.map((r,i)=>{
         if(i!==index||r.status!=='processing')return r
 
         const ceiling=
-          r.progress<40?40:
-          r.progress<70?70:
-          r.progress<91?91:97
+          r.progress<35?35:
+          r.progress<65?65:
+          r.progress<90?90:97
 
         return r.progress<ceiling
           ?{...r,progress:r.progress+1}
           :r
       }))
-    },105)
+    },90)
   }
 
-  async function preciseImageFallback(
-    rendered:HTMLCanvasElement,
-    pageIndex:number,
-    index:number
-  ){
-    const rois=[
-      {x:0,y:.48,width:1,height:.52},
-      {x:0,y:.24,width:1,height:.52}
-    ]
+  async function tryNativePdf(
+    src:Awaited<ReturnType<typeof loadSource>>,
+    regions:SearchRegion[]
+  ):Promise<TargetCandidate|null>{
+    if(src.type!=='pdf')return null
 
-    let allTokens:OCRToken[]=[]
+    const cache=new Map<number,Awaited<ReturnType<typeof getNativePdfTokens>>>()
 
-    for(let i=0;i<rois.length;i++){
-      update(index,{
-        progress:88+i*4,
-        message:'이미지 세부 영역 재판독 중'
-      })
+    for(const region of regions){
+      if(!cache.has(region.pageIndex)){
+        cache.set(
+          region.pageIndex,
+          await getNativePdfTokens(src,region.pageIndex)
+        )
+      }
 
-      const roiCanvas=cropNormalized(rendered,rois[i])
-      const processed=preprocessCanvas(
-        roiCanvas,
-        i===0?'strong':'binary'
+      const pageTokens=cache.get(region.pageIndex) ?? []
+      if(!pageTokens.length)continue
+
+      const inRegion=filterTokensInRect(
+        pageTokens,
+        region.rect
       )
 
-      const tokens=await recognizeWordsPrecise(
-        processed,
-        pageIndex,
-        undefined,
-        true
+      const local=inRegion.map(t=>({
+        ...t,
+        rect:{
+          x:(t.rect.x-region.rect.x)/region.rect.width,
+          y:(t.rect.y-region.rect.y)/region.rect.height,
+          width:t.rect.width/region.rect.width,
+          height:t.rect.height/region.rect.height
+        }
+      }))
+
+      const target=detectTarget(
+        local,
+        region.pageIndex,
+        region.rect
       )
 
-      allTokens.push(...remapTokens(tokens,rois[i]))
+      if(target&&target.confidence>=.68){
+        return target
+      }
     }
 
-    return allTokens
+    return null
   }
 
-  async function processOne(
-    file:File,
+  async function tryOcrRegions(
+    src:Awaited<ReturnType<typeof loadSource>>,
+    regions:SearchRegion[],
     index:number
-  ){
-    const started=performance.now()
+  ):Promise<TargetCandidate|null>{
+    // 페이지 canvas는 한 번만 렌더하고 여러 ROI가 재사용한다.
+    const pageCache=new Map<number,HTMLCanvasElement>()
 
-    const fileType:FileResult['fileType']=
-      file.type==='application/pdf'||
-      file.name.toLowerCase().endsWith('.pdf')
-        ?'pdf':'image'
+    async function pageCanvas(pageIndex:number){
+      if(!pageCache.has(pageIndex)){
+        pageCache.set(
+          pageIndex,
+          await renderPage(
+            src,
+            pageIndex,
+            src.type==='image'?2300:1850
+          )
+        )
+      }
+      return pageCache.get(pageIndex)!
+    }
+
+    // pass 0: gray, 작은 하단 ROI 우선.
+    // pass 1: adaptive, 1차 실패 때만.
+    for(let pass=0;pass<2;pass++){
+      for(let ri=0;ri<regions.length;ri++){
+        const region=regions[ri]
+
+        if(
+          pass===0 &&
+          region.id.endsWith('-full')
+        ){
+          continue
+        }
+
+        update(index,{
+          progress:Math.max(
+            18,
+            18+Math.round(
+              (
+                ri/
+                Math.max(1,regions.length)
+              )*46
+            )
+          ),
+          message:
+            pass===0
+              ?'서명란 후보 확인 중'
+              :'사진 OCR 보정 확인 중'
+        })
+
+        const page=await pageCanvas(
+          region.pageIndex
+        )
+
+        const roi=cropRegion(
+          page,
+          region.rect,
+          pass===0?1380:1540
+        )
+
+        const processed=preprocess(
+          roi,
+          pass===0?'gray':'adaptive'
+        )
+
+        const localTokens=await recognizeRegion(
+          processed,
+          region.pageIndex,
+          undefined,
+          pass===1
+        )
+
+        const target=detectTarget(
+          localTokens,
+          region.pageIndex,
+          region.rect
+        )
+
+        if(
+          target&&
+          target.confidence>=(
+            pass===0?.60:.56
+          )
+        ){
+          return target
+        }
+      }
+    }
+
+    return null
+  }
+
+  async function processOne(file:File,index:number){
+    const started=performance.now()
 
     update(index,{
       status:'processing',
       progress:1,
-      message:'파일 여는 중'
+      message:'문서 확인 중'
     })
-
     startProgress(index)
 
     const src=await loadSource(file)
 
     update(index,{
       pageCount:src.pageCount,
-      progress:6,
-      message:'서명 페이지 찾는 중'
+      progress:8,
+      message:'서명 페이지 분리 중'
     })
 
-    let best:{pageIndex:number;score:number}|null=null
+    const regions=await buildSearchRegions(src)
 
-    if(fileType==='pdf'){
-      // v12: PDF는 먼저 내장 텍스트 레이어만 읽는다. OCR보다 훨씬 빠르다.
-      // 텍스트 레이어가 없는 스캔 PDF일 때만 저해상도 OCR fallback.
-      let nativeFound=false
-      for(let p=0;p<src.pageCount;p++){
-        const text=await getPdfNativeText(src,p)
-        const score=scoreFastPageText(text)
-        if(text.trim()) nativeFound=true
-        if(!best||score>best.score) best={pageIndex:p,score}
-        update(index,{
-          progress:10+Math.round(((p+1)/src.pageCount)*22),
-          message:`서명 페이지 탐색 ${p+1}/${src.pageCount}`
-        })
-      }
+    // 1. PDF 텍스트 레이어: OCR 없이 즉시 좌표 탐색.
+    let target=await tryNativePdf(src,regions)
 
-      if(!nativeFound || !best || best.score<100){
-        best=null
-        for(let p=0;p<src.pageCount;p++){
-          const canvas=await renderSourcePage(src,p,900,false)
-          const fast=await recognizeTextFast(preprocessCanvas(canvas,'strong'))
-          const score=scoreFastPageText(fast.text)+fast.confidence*.03
-          if(!best||score>best.score) best={pageIndex:p,score}
-          update(index,{
-            progress:32+Math.round(((p+1)/src.pageCount)*18),
-            message:`스캔 PDF 탐색 ${p+1}/${src.pageCount}`
-          })
-        }
-      }
-    }else{
-      // JPG/PNG는 페이지 탐색 OCR을 따로 하지 않는다.
-      // 같은 이미지를 두 번 OCR하던 v11의 병목 제거.
-      best={pageIndex:0,score:999}
-      update(index,{progress:34,message:'이미지 서명영역 분석 준비'})
-    }
-
-    if(!best){
-      throw new Error('서명 페이지 후보를 찾지 못했습니다.')
-    }
-
-    update(index,{
-      progress:55,
-      message:`${best.pageIndex+1}페이지 서명영역 분석 중`
-    })
-
-    const preciseMax=fileType==='image'?3000:2300
-
-    const rendered=await renderSourcePage(
-      src,
-      best.pageIndex,
-      preciseMax,
-      true
-    )
-
-    let processed=preprocessCanvas(
-      rendered,
-      fileType==='image'?'strong':'normal'
-    )
-
-    let tokens=await recognizeWordsPrecise(
-      processed,
-      best.pageIndex,
-      p=>{
-        update(index,{
-          progress:Math.max(
-            56,
-            56+Math.round(p*27)
-          ),
-          message:'서명영역 정밀 판독 중'
-        })
-      },
-      fileType==='image'
-    )
-
-    let blocks=detectSigningBlocks(tokens)
-
-    if(!blocks.length&&fileType==='image'){
+    // 2. 스캔 PDF / JPG / PNG: 작은 논리 페이지 하단 ROI부터 OCR.
+    if(!target){
       update(index,{
-        progress:85,
-        message:'이미지 OCR 보정 재시도 중'
+        progress:16,
+        message:'서명란 판독 중'
       })
 
-      processed=preprocessCanvas(rendered,'binary')
-
-      tokens=await recognizeWordsPrecise(
-        processed,
-        best.pageIndex
-      )
-
-      blocks=detectSigningBlocks(tokens)
-    }
-
-    if(!blocks.length&&fileType==='image'){
-      const bandTokens=await preciseImageFallback(
-        rendered,
-        best.pageIndex,
+      target=await tryOcrRegions(
+        src,
+        regions,
         index
       )
-
-      blocks=detectSigningBlocks(bandTokens)
-
-      if(blocks.length){
-        tokens=bandTokens
-      }
     }
 
-    const top=blocks[0]??null
-
-    if(!top){
+    if(!target){
       stopProgress(index)
-
       update(index,{
         status:'failed',
         progress:100,
         message:'서명영역 탐지 실패',
-        pageIndex:best.pageIndex,
         elapsedMs:performance.now()-started
       })
-
       return
     }
 
-    // 최종 결과는 원본 렌더 이미지에서,
-    // 탐지된 년/월/일 + 매수인 + 서명 영역에 40px margin만 추가.
-    const crop=cropCanvasWithMargin(
-      rendered,
-      top.rect,
+    update(index,{
+      progress:93,
+      message:'서명영역 확대 중'
+    })
+
+    const crop=await renderFinalCrop(
+      src,
+      target.pageIndex,
+      target.targetRect,
       40
     )
 
@@ -291,9 +288,8 @@ export default function App(){
     update(index,{
       status:'success',
       progress:100,
-      message:'서명영역 탐지 완료',
-      pageIndex:best.pageIndex,
-      confidence:top.confidence,
+      message:'완료',
+      confidence:target.confidence,
       cropPreview:crop.toDataURL('image/jpeg',.98),
       elapsedMs:performance.now()-started
     })
@@ -310,12 +306,13 @@ export default function App(){
         await processOne(files[i],i)
       }catch(e){
         stopProgress(i)
-
         update(i,{
           status:'failed',
           progress:100,
           message:`오류: ${
-            e instanceof Error?e.message:String(e)
+            e instanceof Error
+              ?e.message
+              :String(e)
           }`
         })
       }
@@ -327,10 +324,9 @@ export default function App(){
   function selectFiles(list:FileList|null){
     if(!list)return
 
-    const arr=Array.from(list)
+    const selected=Array.from(list)
       .filter(f=>{
         const n=f.name.toLowerCase()
-
         return(
           f.type==='application/pdf'||
           f.type==='image/jpeg'||
@@ -343,28 +339,25 @@ export default function App(){
       })
       .slice(0,5)
 
-    setFiles(arr)
+    setFiles(selected)
     setResults([])
   }
 
   function judge(
     index:number,
-    j:FileResult['judgement']
+    judgement:FileResult['judgement']
   ){
-    update(index,{judgement:j})
+    update(index,{judgement})
   }
 
   const stats=useMemo(()=>{
     const judged=results.filter(r=>r.judgement)
-
     const correct=judged.filter(
       r=>r.judgement==='correct'
     ).length
-
     const partial=judged.filter(
       r=>r.judgement==='partial'
     ).length
-
     const total=judged.length
 
     return{
@@ -381,7 +374,7 @@ export default function App(){
   return <div className="app">
     <header>
       <p className="eyebrow">
-        BLANK DATE + BUYER SIGNING AREA
+        LOGICAL PAGE ROI · BLANK BUYER SIGNATURE
       </p>
 
       <h1>
@@ -393,8 +386,7 @@ export default function App(){
       </div>
 
       <p className="sub">
-        숫자가 입력되지 않은 년·월·일과
-        매수인·서명 영역만 확대합니다.
+        숫자가 없는 년·월·일과 매수인·서명 영역만 찾아 확대합니다.
       </p>
     </header>
 
@@ -427,7 +419,7 @@ export default function App(){
       </strong>
 
       <span>
-        비어 있는 날짜·매수인 서명란만 탐지합니다.
+        서명란이 있는 논리 페이지만 자동으로 선택합니다.
       </span>
     </section>
 
@@ -436,7 +428,7 @@ export default function App(){
         {files.map((f,i)=>
           <div
             className="fileChip"
-            key={f.name+i}
+            key={`${f.name}-${i}`}
           >
             <b>{i+1}</b>
             <span>{f.name}</span>
@@ -468,9 +460,7 @@ export default function App(){
 
           {r.status==='success'&&
             <span className="successBadge">
-              {Math.round(
-                r.confidence*100
-              )}%
+              {Math.round(r.confidence*100)}%
             </span>
           }
         </div>
@@ -498,7 +488,7 @@ export default function App(){
               <h3>서명영역</h3>
             </div>
 
-            <div className="signatureCrop v11Crop">
+            <div className="signatureCrop v13Crop">
               <img
                 src={r.cropPreview}
                 alt="탐지된 서명영역"

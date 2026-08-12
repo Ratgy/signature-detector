@@ -1,74 +1,89 @@
-import { createWorker } from 'tesseract.js'
+import { createWorker, PSM } from 'tesseract.js'
 import type { OCRToken } from './types'
 
 let workerPromise: ReturnType<typeof createWorker> | null = null
-let loggerCb: ((p:number,s:string)=>void) | undefined
+let progressHandler: ((p:number,s:string)=>void) | undefined
 
 async function getWorker(onProgress?: (p:number,s:string)=>void) {
-  loggerCb=onProgress
-  if (!workerPromise) {
-    workerPromise = createWorker('kor+eng', undefined, {
-      logger: (m:any) => {
-        if (typeof m.progress === 'number') loggerCb?.(m.progress, m.status ?? 'OCR')
+  progressHandler=onProgress
+
+  if(!workerPromise){
+    // v13: target words are Korean. Loading only kor reduces model/setup overhead.
+    workerPromise=createWorker('kor', undefined, {
+      logger:(m:any)=>{
+        if(typeof m.progress==='number'){
+          progressHandler?.(m.progress,m.status ?? 'OCR')
+        }
       }
     })
-    const w=await workerPromise
-    await w.setParameters({
+
+    const worker=await workerPromise
+    await worker.setParameters({
       preserve_interword_spaces:'1',
       user_defined_dpi:'300',
+      tessedit_pageseg_mode:PSM.SINGLE_BLOCK,
     } as any)
-    return w
+    return worker
   }
+
   return workerPromise
 }
 
-export async function recognizeTextFast(canvas: HTMLCanvasElement) {
-  const w = await getWorker()
-  await w.setParameters({
-    tessedit_pageseg_mode:'11',
-    preserve_interword_spaces:'1'
-  } as any)
-  const r:any = await w.recognize(canvas)
-  return { text:String(r.data?.text ?? ''), confidence:Number(r.data?.confidence ?? 0) }
+function extractWords(result:any, pageIndex:number, width:number, height:number):OCRToken[]{
+  const words:any[]=[]
+
+  for(const block of result.data?.blocks ?? []){
+    for(const paragraph of block.paragraphs ?? []){
+      for(const line of paragraph.lines ?? []){
+        for(const word of line.words ?? []){
+          words.push(word)
+        }
+      }
+    }
+  }
+
+  return words
+    .filter(w=>w?.text?.trim() && w?.bbox)
+    .map(w=>({
+      text:String(w.text).trim(),
+      confidence:Number(w.confidence ?? 0),
+      pageIndex,
+      rect:{
+        x:w.bbox.x0/width,
+        y:w.bbox.y0/height,
+        width:(w.bbox.x1-w.bbox.x0)/width,
+        height:(w.bbox.y1-w.bbox.y0)/height,
+      }
+    }))
 }
 
-export async function recognizeWordsPrecise(
-  canvas: HTMLCanvasElement,
-  pageIndex: number,
+export async function recognizeRegion(
+  canvas:HTMLCanvasElement,
+  pageIndex:number,
   onProgress?: (p:number,s:string)=>void,
   sparse=false
-): Promise<OCRToken[]> {
-  const w = await getWorker(onProgress)
-  await w.setParameters({
-    tessedit_pageseg_mode:sparse?'11':'6',
+):Promise<OCRToken[]>{
+  const worker=await getWorker(onProgress)
+
+  await worker.setParameters({
     preserve_interword_spaces:'1',
-    user_defined_dpi:'300'
+    user_defined_dpi:'300',
+    tessedit_pageseg_mode:sparse ? PSM.SPARSE_TEXT : PSM.SINGLE_BLOCK,
   } as any)
 
-  const r:any = await w.recognize(canvas, {}, { blocks:true, text:true })
-  const words:any[] = []
-  for (const block of r.data?.blocks ?? [])
-    for (const paragraph of block.paragraphs ?? [])
-      for (const line of paragraph.lines ?? [])
-        for (const word of line.words ?? []) words.push(word)
+  const result:any=await worker.recognize(
+    canvas,
+    {},
+    {blocks:true,text:true}
+  )
 
-  return words.filter(w => w?.text?.trim() && w?.bbox).map(w => ({
-    text:String(w.text).trim(),
-    confidence:Number(w.confidence ?? 0),
-    pageIndex,
-    rect:{
-      x:w.bbox.x0/canvas.width,
-      y:w.bbox.y0/canvas.height,
-      width:(w.bbox.x1-w.bbox.x0)/canvas.width,
-      height:(w.bbox.y1-w.bbox.y0)/canvas.height,
-    }
-  }))
+  return extractWords(result,pageIndex,canvas.width,canvas.height)
 }
 
-export async function terminateOCR() {
-  if (workerPromise) {
-    const w = await workerPromise
-    await w.terminate()
-    workerPromise = null
+export async function terminateOCR(){
+  if(workerPromise){
+    const worker=await workerPromise
+    await worker.terminate()
+    workerPromise=null
   }
 }

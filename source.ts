@@ -1,15 +1,15 @@
 import * as pdfjsLib from 'pdfjs-dist'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
-import type { NormalizedRect } from './types'
+import type { OCRToken, Rect, SearchRegion } from './types'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc=new URL(
   'pdfjs-dist/build/pdf.worker.mjs',
   import.meta.url
 ).toString()
 
-export type LoadedSource=
-  | {type:'pdf';pdf:PDFDocumentProxy;pageCount:number}
-  | {type:'image';image:HTMLImageElement;pageCount:1}
+export type LoadedSource =
+  | {type:'pdf'; pdf:PDFDocumentProxy; pageCount:number}
+  | {type:'image'; image:HTMLImageElement; pageCount:1}
 
 export async function loadSource(file:File):Promise<LoadedSource>{
   const n=file.name.toLowerCase()
@@ -22,7 +22,8 @@ export async function loadSource(file:File):Promise<LoadedSource>{
   }
 
   if(
-    file.type.startsWith('image/')||
+    file.type==='image/jpeg'||
+    file.type==='image/png'||
     n.endsWith('.jpg')||
     n.endsWith('.jpeg')||
     n.endsWith('.png')
@@ -46,207 +47,418 @@ export async function loadSource(file:File):Promise<LoadedSource>{
   throw new Error('PDF/JPG/PNG만 지원합니다.')
 }
 
-async function renderPdf(page:PDFPageProxy,maxSide:number){
+export async function getPageSize(src:LoadedSource,pageIndex:number){
+  if(src.type==='image'){
+    return{width:src.image.naturalWidth,height:src.image.naturalHeight}
+  }
+
+  const page=await src.pdf.getPage(pageIndex+1)
+  const vp=page.getViewport({scale:1})
+  return{width:vp.width,height:vp.height}
+}
+
+// v13 핵심:
+// 1) 마지막 PDF 페이지부터 확인
+// 2) 가로로 2쪽이 붙어 있으면 논리 페이지를 좌/우로 분리
+// 3) 각 논리 페이지의 하단부터 확인
+export async function buildSearchRegions(src:LoadedSource):Promise<SearchRegion[]>{
+  const regions:SearchRegion[]=[]
+  const pages=[...Array(src.pageCount)].map((_,i)=>src.pageCount-1-i)
+  let priority=0
+
+  for(const pageIndex of pages){
+    const {width,height}=await getPageSize(src,pageIndex)
+    const landscape=width/height>1.18
+
+    if(landscape){
+      const panels=[
+        {id:'right',x:.485,width:.515},
+        {id:'left',x:0,width:.515},
+      ]
+
+      for(const panel of panels){
+        // 사용자 샘플 5종에서 실제 서명란이 모두 이 영역 안에 들어옴.
+        regions.push({
+          id:`p${pageIndex}-${panel.id}-bottom`,
+          pageIndex,
+          priority:priority++,
+          rect:{x:panel.x,y:.50,width:panel.width,height:.50}
+        })
+        regions.push({
+          id:`p${pageIndex}-${panel.id}-lower`,
+          pageIndex,
+          priority:priority++,
+          rect:{x:panel.x,y:.27,width:panel.width,height:.73}
+        })
+      }
+
+      // 하단 탐색 실패 때만 논리 페이지 전체로 fallback.
+      for(const panel of panels){
+        regions.push({
+          id:`p${pageIndex}-${panel.id}-full`,
+          pageIndex,
+          priority:priority++,
+          rect:{x:panel.x,y:0,width:panel.width,height:1}
+        })
+      }
+    }else{
+      regions.push({
+        id:`p${pageIndex}-bottom`,
+        pageIndex,
+        priority:priority++,
+        rect:{x:0,y:.50,width:1,height:.50}
+      })
+      regions.push({
+        id:`p${pageIndex}-lower`,
+        pageIndex,
+        priority:priority++,
+        rect:{x:0,y:.27,width:1,height:.73}
+      })
+      regions.push({
+        id:`p${pageIndex}-full`,
+        pageIndex,
+        priority:priority++,
+        rect:{x:0,y:0,width:1,height:1}
+      })
+    }
+  }
+
+  return regions
+}
+
+
+async function renderPdfPage(
+  page:PDFPageProxy,
+  targetLongSide:number
+){
   const base=page.getViewport({scale:1})
-  const scale=Math.max(.6,Math.min(3.4,maxSide/Math.max(base.width,base.height)))
+  const scale=Math.max(
+    .55,
+    Math.min(
+      3.0,
+      targetLongSide/Math.max(base.width,base.height)
+    )
+  )
   const vp=page.getViewport({scale})
 
-  const c=document.createElement('canvas')
-  c.width=Math.ceil(vp.width)
-  c.height=Math.ceil(vp.height)
+  const canvas=document.createElement('canvas')
+  canvas.width=Math.ceil(vp.width)
+  canvas.height=Math.ceil(vp.height)
 
-  const ctx=c.getContext('2d',{willReadFrequently:true})!
+  const ctx=canvas.getContext(
+    '2d',
+    {willReadFrequently:true}
+  )!
+
   ctx.fillStyle='#fff'
-  ctx.fillRect(0,0,c.width,c.height)
+  ctx.fillRect(0,0,canvas.width,canvas.height)
 
-  await page.render({canvasContext:ctx,viewport:vp,canvas:c}).promise
-  return c
+  await page.render({
+    canvasContext:ctx,
+    viewport:vp
+  }).promise
+
+  return canvas
 }
 
-function renderImage(
+function renderImagePage(
   img:HTMLImageElement,
-  maxSide:number,
-  allowUpscale:boolean
+  targetLongSide:number
 ){
-  const srcMax=Math.max(img.naturalWidth,img.naturalHeight)
-  let scale=maxSide/srcMax
+  const srcLong=Math.max(
+    img.naturalWidth,
+    img.naturalHeight
+  )
 
-  if(!allowUpscale)scale=Math.min(1,scale)
+  // 사진은 원본이 작아도 OCR 전처리를 위해 최대 2.6배까지만 확대.
+  const scale=Math.min(
+    2.6,
+    Math.max(.5,targetLongSide/srcLong)
+  )
 
-  // JPG/PNG OCR accuracy 우선. 최대 4배 업스케일 허용.
-  scale=Math.min(4.0,Math.max(.5,scale))
+  const canvas=document.createElement('canvas')
+  canvas.width=Math.max(
+    1,
+    Math.round(img.naturalWidth*scale)
+  )
+  canvas.height=Math.max(
+    1,
+    Math.round(img.naturalHeight*scale)
+  )
 
-  const c=document.createElement('canvas')
-  c.width=Math.max(1,Math.round(img.naturalWidth*scale))
-  c.height=Math.max(1,Math.round(img.naturalHeight*scale))
+  const ctx=canvas.getContext(
+    '2d',
+    {willReadFrequently:true}
+  )!
 
-  const ctx=c.getContext('2d',{willReadFrequently:true})!
   ctx.fillStyle='#fff'
-  ctx.fillRect(0,0,c.width,c.height)
-
+  ctx.fillRect(0,0,canvas.width,canvas.height)
   ctx.imageSmoothingEnabled=true
   ctx.imageSmoothingQuality='high'
-  ctx.drawImage(img,0,0,c.width,c.height)
 
-  return c
+  ctx.drawImage(
+    img,
+    0,0,
+    canvas.width,
+    canvas.height
+  )
+
+  return canvas
 }
 
-export async function renderSourcePage(
+export async function renderPage(
   src:LoadedSource,
   pageIndex:number,
-  maxSide:number,
-  precise=false
+  targetLongSide=1900
 ){
-  if(src.type==='pdf'){
-    return renderPdf(await src.pdf.getPage(pageIndex+1),maxSide)
+  if(src.type==='image'){
+    return renderImagePage(
+      src.image,
+      targetLongSide
+    )
   }
-  return renderImage(src.image,maxSide,precise)
+
+  const page=await src.pdf.getPage(pageIndex+1)
+  return renderPdfPage(
+    page,
+    targetLongSide
+  )
 }
 
-function otsuThreshold(data:Uint8ClampedArray){
-  const hist=new Array(256).fill(0)
-  let total=0
+export function cropRegion(
+  pageCanvas:HTMLCanvasElement,
+  rect:Rect,
+  targetLongSide=1450
+){
+  const sx=Math.max(
+    0,
+    Math.floor(rect.x*pageCanvas.width)
+  )
+  const sy=Math.max(
+    0,
+    Math.floor(rect.y*pageCanvas.height)
+  )
+  const sw=Math.max(
+    1,
+    Math.min(
+      pageCanvas.width-sx,
+      Math.ceil(rect.width*pageCanvas.width)
+    )
+  )
+  const sh=Math.max(
+    1,
+    Math.min(
+      pageCanvas.height-sy,
+      Math.ceil(rect.height*pageCanvas.height)
+    )
+  )
 
-  for(let i=0;i<data.length;i+=4){
-    const g=Math.round(.299*data[i]+.587*data[i+1]+.114*data[i+2])
-    hist[g]++
-    total++
-  }
+  const scale=Math.max(
+    1,
+    Math.min(
+      2.2,
+      targetLongSide/Math.max(sw,sh)
+    )
+  )
 
-  let sum=0
-  for(let i=0;i<256;i++)sum+=i*hist[i]
+  const out=document.createElement('canvas')
+  out.width=Math.max(1,Math.round(sw*scale))
+  out.height=Math.max(1,Math.round(sh*scale))
 
-  let sumB=0,wB=0,maxVar=0,threshold=128
+  const ctx=out.getContext(
+    '2d',
+    {willReadFrequently:true}
+  )!
 
-  for(let t=0;t<256;t++){
-    wB+=hist[t]
-    if(wB===0)continue
+  ctx.fillStyle='#fff'
+  ctx.fillRect(0,0,out.width,out.height)
+  ctx.imageSmoothingEnabled=true
+  ctx.imageSmoothingQuality='high'
 
-    const wF=total-wB
-    if(wF===0)break
+  ctx.drawImage(
+    pageCanvas,
+    sx,sy,sw,sh,
+    0,0,out.width,out.height
+  )
 
-    sumB+=t*hist[t]
-    const mB=sumB/wB
-    const mF=(sum-sumB)/wF
-    const between=wB*wF*(mB-mF)*(mB-mF)
-
-    if(between>maxVar){
-      maxVar=between
-      threshold=t
-    }
-  }
-
-  return threshold
+  return out
 }
 
-export function preprocessCanvas(
+export function preprocess(
   source:HTMLCanvasElement,
-  mode:'normal'|'strong'|'binary'='normal'
+  mode:'gray'|'adaptive'='gray'
 ){
-  const c=document.createElement('canvas')
-  c.width=source.width
-  c.height=source.height
-
-  const ctx=c.getContext('2d',{willReadFrequently:true})!
+  const out=document.createElement('canvas')
+  out.width=source.width
+  out.height=source.height
+  const ctx=out.getContext('2d',{willReadFrequently:true})!
   ctx.drawImage(source,0,0)
 
-  const img=ctx.getImageData(0,0,c.width,c.height)
+  const img=ctx.getImageData(0,0,out.width,out.height)
   const d=img.data
 
-  const threshold=mode==='binary'?otsuThreshold(d):128
-  const contrast=mode==='strong'?1.50:1.22
-
-  for(let i=0;i<d.length;i+=4){
-    const g=.299*d[i]+.587*d[i+1]+.114*d[i+2]
-
-    let v:number
-
-    if(mode==='binary'){
-      v=g>threshold?255:0
-    }else{
-      v=(g-128)*contrast+128+(mode==='strong'?6:2)
-      if(mode==='strong'){
-        if(v>215)v=248
-        else if(v<75)v=28
-      }
+  if(mode==='gray'){
+    for(let i=0;i<d.length;i+=4){
+      const g=.299*d[i]+.587*d[i+1]+.114*d[i+2]
+      let v=(g-128)*1.32+132
+      v=Math.max(0,Math.min(255,v))
+      d[i]=d[i+1]=d[i+2]=v
     }
+    ctx.putImageData(img,0,0)
+    return out
+  }
 
-    v=Math.max(0,Math.min(255,v))
-    d[i]=d[i+1]=d[i+2]=v
+  // 사진 촬영본의 조명/그림자 대응용 간단 adaptive threshold.
+  const w=out.width,h=out.height
+  const gray=new Uint8Array(w*h)
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      const i=(y*w+x)*4
+      gray[y*w+x]=Math.round(.299*d[i]+.587*d[i+1]+.114*d[i+2])
+    }
+  }
+
+  const integral=new Float64Array((w+1)*(h+1))
+  for(let y=1;y<=h;y++){
+    let row=0
+    for(let x=1;x<=w;x++){
+      row+=gray[(y-1)*w+(x-1)]
+      integral[y*(w+1)+x]=integral[(y-1)*(w+1)+x]+row
+    }
+  }
+
+  const radius=Math.max(12,Math.round(Math.min(w,h)*.018))
+  const bias=12
+
+  for(let y=0;y<h;y++){
+    const y0=Math.max(0,y-radius)
+    const y1=Math.min(h-1,y+radius)
+    for(let x=0;x<w;x++){
+      const x0=Math.max(0,x-radius)
+      const x1=Math.min(w-1,x+radius)
+
+      const A=integral[y0*(w+1)+x0]
+      const B=integral[y0*(w+1)+(x1+1)]
+      const C=integral[(y1+1)*(w+1)+x0]
+      const D=integral[(y1+1)*(w+1)+(x1+1)]
+      const area=(x1-x0+1)*(y1-y0+1)
+      const mean=(D-B-C+A)/area
+
+      const v=gray[y*w+x] < mean-bias ? 0 : 255
+      const i=(y*w+x)*4
+      d[i]=d[i+1]=d[i+2]=v
+    }
   }
 
   ctx.putImageData(img,0,0)
-  return c
+  return out
 }
 
-export function cropCanvasWithMargin(
-  source:HTMLCanvasElement,
-  r:NormalizedRect,
-  marginPx=40
-){
-  const rawX=r.x*source.width
-  const rawY=r.y*source.height
-  const rawW=r.width*source.width
-  const rawH=r.height*source.height
-
-  const sx=Math.max(0,Math.floor(rawX-marginPx))
-  const sy=Math.max(0,Math.floor(rawY-marginPx))
-  const x2=Math.min(source.width,Math.ceil(rawX+rawW+marginPx))
-  const y2=Math.min(source.height,Math.ceil(rawY+rawH+marginPx))
-
-  const sw=Math.max(1,x2-sx)
-  const sh=Math.max(1,y2-sy)
-
-  const c=document.createElement('canvas')
-  c.width=sw
-  c.height=sh
-
-  c.getContext('2d')!.drawImage(
-    source,
-    sx,sy,sw,sh,
-    0,0,sw,sh
-  )
-
-  return c
+export function remapTokens(
+  tokens:OCRToken[],
+  region:SearchRegion
+):OCRToken[]{
+  return tokens.map(t=>({
+    ...t,
+    rect:{
+      x:region.rect.x+t.rect.x*region.rect.width,
+      y:region.rect.y+t.rect.y*region.rect.height,
+      width:t.rect.width*region.rect.width,
+      height:t.rect.height*region.rect.height
+    }
+  }))
 }
 
-export function cropNormalized(
-  source:HTMLCanvasElement,
-  r:NormalizedRect
-){
-  const sx=Math.max(0,Math.floor(r.x*source.width))
-  const sy=Math.max(0,Math.floor(r.y*source.height))
-  const sw=Math.max(1,Math.min(
-    source.width-sx,
-    Math.ceil(r.width*source.width)
-  ))
-  const sh=Math.max(1,Math.min(
-    source.height-sy,
-    Math.ceil(r.height*source.height)
-  ))
+export async function getNativePdfTokens(
+  src:LoadedSource,
+  pageIndex:number
+):Promise<OCRToken[]>{
+  if(src.type!=='pdf')return[]
 
-  const c=document.createElement('canvas')
-  c.width=sw
-  c.height=sh
-  c.getContext('2d')!.drawImage(
-    source,
-    sx,sy,sw,sh,
-    0,0,sw,sh
-  )
-
-  return c
-}
-
-
-export async function getPdfNativeText(src:LoadedSource,pageIndex:number){
-  if(src.type!=='pdf') return ''
   try{
     const page=await src.pdf.getPage(pageIndex+1)
+    const viewport=page.getViewport({scale:1})
     const content=await page.getTextContent()
-    return (content.items as any[])
-      .map((it:any)=>String(it?.str ?? ''))
-      .join(' ')
+    const out:OCRToken[]=[]
+
+    for(const item of content.items as any[]){
+      const text=String(item?.str ?? '').trim()
+      if(!text)continue
+
+      const tx=pdfjsLib.Util.transform(
+        viewport.transform,
+        item.transform
+      )
+
+      const height=Math.max(
+        1,
+        Math.hypot(tx[2],tx[3])
+      )
+      const width=Math.max(
+        1,
+        Number(item.width ?? 0)*viewport.scale
+      )
+
+      out.push({
+        text,
+        confidence:100,
+        pageIndex,
+        rect:{
+          x:tx[4]/viewport.width,
+          y:(tx[5]-height)/viewport.height,
+          width:width/viewport.width,
+          height:height/viewport.height
+        }
+      })
+    }
+
+    return out
   }catch{
-    return ''
+    return[]
   }
+}
+
+export function filterTokensInRect(tokens:OCRToken[],rect:Rect){
+  return tokens.filter(t=>{
+    const x=t.rect.x+t.rect.width/2
+    const y=t.rect.y+t.rect.height/2
+    return x>=rect.x && x<=rect.x+rect.width &&
+      y>=rect.y && y<=rect.y+rect.height
+  })
+}
+
+
+export async function renderFinalCrop(
+  src:LoadedSource,
+  pageIndex:number,
+  rect:Rect,
+  marginPx=40
+){
+  const pageCanvas=await renderPage(
+    src,
+    pageIndex,
+    2300
+  )
+
+  const mx=marginPx/pageCanvas.width
+  const my=marginPx/pageCanvas.height
+
+  const expanded:Rect={
+    x:Math.max(0,rect.x-mx),
+    y:Math.max(0,rect.y-my),
+    width:Math.min(
+      1-Math.max(0,rect.x-mx),
+      rect.width+mx*2
+    ),
+    height:Math.min(
+      1-Math.max(0,rect.y-my),
+      rect.height+my*2
+    )
+  }
+
+  return cropRegion(
+    pageCanvas,
+    expanded,
+    1800
+  )
 }

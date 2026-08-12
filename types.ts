@@ -1,6 +1,4 @@
-export type Rotation = 0
-
-export interface NormalizedRect {
+export interface Rect {
   x:number
   y:number
   width:number
@@ -10,15 +8,23 @@ export interface NormalizedRect {
 export interface OCRToken {
   text:string
   confidence:number
-  rect:NormalizedRect
+  rect:Rect
   pageIndex:number
 }
 
-export interface SigningBlock {
+export interface SearchRegion {
+  id:string
   pageIndex:number
-  rect:NormalizedRect
-  confidence:number
+  rect:Rect
+  priority:number
+}
+
+export interface TargetCandidate {
+  pageIndex:number
+  region:Rect
+  targetRect:Rect
   score:number
+  confidence:number
 }
 
 export interface FileResult {
@@ -29,9 +35,8 @@ export interface FileResult {
   progress:number
   message:string
   pageCount:number
-  pageIndex:number|null
   confidence:number
   cropPreview:string|null
   elapsedMs:number
-  judgement?:'correct'|'partial'|'wrong'|'failed'
+  judgement?:'correct'|'partial'|'wrong'
 }
