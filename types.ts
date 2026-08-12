@@ -14,60 +14,21 @@ export interface OCRToken {
   pageIndex: number
 }
 
-export interface KeywordMatch extends OCRToken {
-  keyword: string
-  similarity: number
-  weight: number
-}
-
-export interface ScoreBreakdown {
-  keyword: number
-  proximity: number
-  layout: number
-  position: number
-  ocr: number
-}
-
-export interface SignatureCandidate {
-  id: string
-  pageIndex: number
-  rect: NormalizedRect
-  rotatedRect: NormalizedRect
-  rotation: Rotation
-  score: number
-  confidence: number
-  matchedKeywords: string[]
-  breakdown: ScoreBreakdown
-}
-
-export interface PageAnalysis {
-  pageIndex: number
-  width: number
-  height: number
-  rotation: Rotation
-  tokens: OCRToken[]
-  candidates: SignatureCandidate[]
-  previewDataUrl: string
-  ocrDataUrl: string
-  elapsedMs: number
-}
-
-export type TestJudgement = 'correct' | 'partial' | 'wrong' | 'failed'
-
-export interface SavedResult {
-  fileName: string
-  timestamp: number
-  score: number
-  confidence: number
-  pageIndex: number | null
-  judgement: TestJudgement
-}
-
-
 export interface SignatureTarget {
   pageIndex: number
   rotation: Rotation
   rect: NormalizedRect
-  source: 'date-anchor' | 'buyer-anchor' | 'blank-line' | 'fallback'
+  dateRect: NormalizedRect | null
+  signerRect: NormalizedRect | null
+  source: 'date-anchor' | 'buyer-anchor' | 'line-pair' | 'fallback'
   confidence: number
+}
+
+export interface DetectionCandidate {
+  pageIndex: number
+  rotation: Rotation
+  score: number
+  confidence: number
+  target: SignatureTarget | null
+  matchedTexts: string[]
 }
