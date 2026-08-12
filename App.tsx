@@ -170,10 +170,11 @@ export default function App(){
   return <div className="app">
     <header>
       <div>
-        <p className="eyebrow">CONTEXT LAYOUT DETECTION · NO AUTO ROTATION</p>
-        <h1>서명영역 탐지 검수 v8</h1>
+        <p className="eyebrow">BUYER ACKNOWLEDGEMENT DETECTION · NO AUTO ROTATION</p>
+        <h1>서명영역 탐지 검수 v9.1</h1>
+        <div style={{display:'inline-flex',marginTop:8,padding:'5px 9px',borderRadius:999,background:'#fff3c4',fontSize:12,fontWeight:800}}>BUILD 9.1 · 2026-08-12</div>
         <p className="sub">
-          ‘확인합니다’ 문장 → 그 아래의 연/년·월·일 → 서명/(인)/매수인 줄 구조를 함께 보고 서명 블록을 찾습니다.
+          ‘확인’ 문맥 → 빈 년·월·일 → 매수인 → 서명 또는 인의 결합 구조를 우선 탐지합니다. 정확 문자열 일치만 요구하지 않습니다.
         </p>
       </div>
     </header>

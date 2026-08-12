@@ -1,3 +1,7 @@
+# Signature Detector Batch v9.1
+
+UI build marker와 package version을 v9.1로 동기화한 배포 검증 버전입니다.
+
 # Signature Detector Batch v9
 
 실패 원인 수정 버전.
