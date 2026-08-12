@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { detectTarget } from './detection'
+import { detectTarget, scoreRegionHints } from './detection'
 import { recognizeRegion, terminateOCR } from './ocr'
 import {
   buildSearchRegions,
@@ -18,7 +18,7 @@ import type {
   TargetCandidate
 } from './types'
 
-const VERSION='13.1'
+const VERSION='13.2'
 const BUILD='2026-08-12'
 
 const makeId=()=>Math.random().toString(36).slice(2)
@@ -89,6 +89,7 @@ export default function App(){
     if(src.type!=='pdf')return null
 
     const cache=new Map<number,Awaited<ReturnType<typeof getNativePdfTokens>>>()
+    let best:TargetCandidate|null=null
 
     for(const region of regions){
       if(!cache.has(region.pageIndex)){
@@ -101,11 +102,7 @@ export default function App(){
       const pageTokens=cache.get(region.pageIndex) ?? []
       if(!pageTokens.length)continue
 
-      const inRegion=filterTokensInRect(
-        pageTokens,
-        region.rect
-      )
-
+      const inRegion=filterTokensInRect(pageTokens,region.rect)
       const local=inRegion.map(t=>({
         ...t,
         rect:{
@@ -116,18 +113,11 @@ export default function App(){
         }
       }))
 
-      const target=detectTarget(
-        local,
-        region.pageIndex,
-        region.rect
-      )
-
-      if(target&&target.confidence>=.68){
-        return target
-      }
+      const target=detectTarget(local,region.pageIndex,region.rect)
+      if(target&&(!best||target.score>best.score))best=target
     }
 
-    return null
+    return best&&best.confidence>=.62?best:null
   }
 
   async function tryOcrRegions(
@@ -135,92 +125,80 @@ export default function App(){
     regions:SearchRegion[],
     index:number
   ):Promise<TargetCandidate|null>{
-    // 페이지 canvas는 한 번만 렌더하고 여러 ROI가 재사용한다.
+    // 물리 페이지는 한 번만 렌더하고, 겹치는 상/하 ROI가 재사용한다.
     const pageCache=new Map<number,HTMLCanvasElement>()
-
     async function pageCanvas(pageIndex:number){
       if(!pageCache.has(pageIndex)){
         pageCache.set(
           pageIndex,
-          await renderPage(
-            src,
-            pageIndex,
-            src.type==='image'?2300:1850
-          )
+          await renderPage(src,pageIndex,src.type==='image'?2200:1750)
         )
       }
       return pageCache.get(pageIndex)!
     }
 
-    // pass 0: gray, 작은 하단 ROI 우선.
-    // pass 1: adaptive, 1차 실패 때만.
-    for(let pass=0;pass<2;pass++){
-      for(let ri=0;ri<regions.length;ri++){
-        const region=regions[ri]
+    let best:TargetCandidate|null=null
+    const hints:{region:SearchRegion;score:number}[]=[]
 
-        if(
-          pass===0 &&
-          region.id.endsWith('-full')
-        ){
-          continue
-        }
+    // 1차: 모든 위치를 동등하게 검사. 한쪽 하단 같은 위치 우선순위 없음.
+    for(let ri=0;ri<regions.length;ri++){
+      const region=regions[ri]
+      if(region.id.includes('-wide-'))continue
+      update(index,{
+        progress:Math.max(18,18+Math.round(((ri+1)/regions.length)*48)),
+        message:'서명영역 위치 확인 중'
+      })
 
-        update(index,{
-          progress:Math.max(
-            18,
-            18+Math.round(
-              (
-                ri/
-                Math.max(1,regions.length)
-              )*46
-            )
-          ),
-          message:
-            pass===0
-              ?'서명란 후보 확인 중'
-              :'사진 OCR 보정 확인 중'
-        })
+      const page=await pageCanvas(region.pageIndex)
+      const roi=cropRegion(page,region.rect,1180)
+      const processed=preprocess(roi,'gray')
+      const tokens=await recognizeRegion(processed,region.pageIndex,undefined,true)
 
-        const page=await pageCanvas(
-          region.pageIndex
-        )
+      const target=detectTarget(tokens,region.pageIndex,region.rect)
+      if(target&&(!best||target.score>best.score))best=target
+      hints.push({region,score:scoreRegionHints(tokens)})
 
-        const roi=cropRegion(
-          page,
-          region.rect,
-          pass===0?1380:1540
-        )
+      // 위치 우선순위는 없지만, 구조가 아주 강하게 일치하면 즉시 종료해 속도를 확보한다.
+      if(target&&target.confidence>=.84)return target
+    }
 
-        const processed=preprocess(
-          roi,
-          pass===0?'gray':'adaptive'
-        )
-
-        const localTokens=await recognizeRegion(
-          processed,
-          region.pageIndex,
-          undefined,
-          pass===1
-        )
-
-        const target=detectTarget(
-          localTokens,
-          region.pageIndex,
-          region.rect
-        )
-
-        if(
-          target&&
-          target.confidence>=(
-            pass===0?.60:.56
-          )
-        ){
-          return target
-        }
+    // split panel에서 못 찾은 landscape 문서만 full-width upper/lower를 검사한다.
+    if(!best){
+      const wideRegions=regions.filter(r=>r.id.includes('-wide-'))
+      for(const region of wideRegions){
+        const page=await pageCanvas(region.pageIndex)
+        const roi=cropRegion(page,region.rect,1180)
+        const processed=preprocess(roi,'gray')
+        const tokens=await recognizeRegion(processed,region.pageIndex,undefined,true)
+        const target=detectTarget(tokens,region.pageIndex,region.rect)
+        if(target&&(!best||target.score>best.score))best=target
+        hints.push({region,score:scoreRegionHints(tokens)})
+        if(target&&target.confidence>=.84)return target
       }
     }
 
-    return null
+    // 완전한 후보가 있으면 전체 위치를 비교한 뒤 가장 높은 후보 하나만 채택.
+    if(best&&best.confidence>=.60)return best
+
+    // 2차는 전 영역을 재OCR하지 않는다. 1차에서 관련 글자가 가장 많이 보인 ROI 최대 2개만 보정한다.
+    const retry=hints.sort((a,b)=>b.score-a.score).slice(0,2)
+    for(let i=0;i<retry.length;i++){
+      const region=retry[i].region
+      update(index,{
+        progress:72+i*8,
+        message:'OCR 정밀 보정 중'
+      })
+
+      const page=await pageCanvas(region.pageIndex)
+      const roi=cropRegion(page,region.rect,1550)
+      const processed=preprocess(roi,'adaptive')
+      const tokens=await recognizeRegion(processed,region.pageIndex,undefined,true)
+      const target=detectTarget(tokens,region.pageIndex,region.rect)
+
+      if(target&&(!best||target.score>best.score))best=target
+    }
+
+    return best&&best.confidence>=.55?best:null
   }
 
   async function processOne(file:File,index:number){

@@ -449,3 +449,21 @@ export function detectTarget(
 
   return best
 }
+
+
+export function scoreRegionHints(tokens:OCRToken[]){
+  const expanded=expandedTokens(tokens)
+  let buyer=0,sign=0,date=0,confirm=0
+
+  for(const t of expanded){
+    buyer=Math.max(buyer,tokenBuyerScore(t.text))
+    sign=Math.max(sign,tokenSignScore(t.text))
+    confirm=Math.max(confirm,tokenConfirmScore(t.text))
+  }
+
+  const dates=findBlankDateCluster(expanded)
+  if(dates.length)date=Math.min(1,dates[0].score/100)
+
+  // 매수인/서명/빈 날짜를 가장 강하게 보고 확인 문구는 보조로만 사용.
+  return buyer*42+sign*34+date*48+confirm*10
+}

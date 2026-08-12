@@ -63,69 +63,60 @@ export async function getPageSize(src:LoadedSource,pageIndex:number){
 // 3) 각 논리 페이지의 하단부터 확인
 export async function buildSearchRegions(src:LoadedSource):Promise<SearchRegion[]>{
   const regions:SearchRegion[]=[]
-  const pages=[...Array(src.pageCount)].map((_,i)=>src.pageCount-1-i)
   let priority=0
 
-  for(const pageIndex of pages){
+  // 위치를 가정하지 않는다. 모든 물리 페이지를 검사하고,
+  // 가로 2쪽 스캔은 먼저 좌/우 논리 페이지로 분리한다.
+  for(let pageIndex=0;pageIndex<src.pageCount;pageIndex++){
     const {width,height}=await getPageSize(src,pageIndex)
-    const landscape=width/height>1.18
+    const spread=width/height>1.18
 
-    if(landscape){
-      const panels=[
-        {id:'right',x:.485,width:.515},
-        {id:'left',x:0,width:.515},
-      ]
+    const panels=spread
+      ?[
+          {id:'left', x:0,    width:.52},
+          {id:'right',x:.48,  width:.52},
+        ]
+      :[
+          {id:'page', x:0, width:1},
+        ]
 
-      for(const panel of panels){
-        // 사용자 샘플 5종에서 실제 서명란이 모두 이 영역 안에 들어옴.
-        regions.push({
-          id:`p${pageIndex}-${panel.id}-bottom`,
-          pageIndex,
-          priority:priority++,
-          rect:{x:panel.x,y:.50,width:panel.width,height:.50}
-        })
-        regions.push({
-          id:`p${pageIndex}-${panel.id}-lower`,
-          pageIndex,
-          priority:priority++,
-          rect:{x:panel.x,y:.27,width:panel.width,height:.73}
-        })
-      }
-
-      // 하단 탐색 실패 때만 논리 페이지 전체로 fallback.
-      for(const panel of panels){
-        regions.push({
-          id:`p${pageIndex}-${panel.id}-full`,
-          pageIndex,
-          priority:priority++,
-          rect:{x:panel.x,y:0,width:panel.width,height:1}
-        })
-      }
-    }else{
+    for(const panel of panels){
+      // 상/중/하 위치를 하드코딩하지 않고 두 개의 겹치는 반쪽으로 전체 높이를 커버한다.
+      // target block 높이가 작기 때문에 어느 위치에 있어도 최소 한 ROI 안에 온전히 들어간다.
       regions.push({
-        id:`p${pageIndex}-bottom`,
+        id:`p${pageIndex}-${panel.id}-upper`,
         pageIndex,
         priority:priority++,
-        rect:{x:0,y:.50,width:1,height:.50}
+        rect:{x:panel.x,y:0,width:panel.width,height:.58}
       })
       regions.push({
-        id:`p${pageIndex}-lower`,
+        id:`p${pageIndex}-${panel.id}-lower`,
         pageIndex,
         priority:priority++,
-        rect:{x:0,y:.27,width:1,height:.73}
+        rect:{x:panel.x,y:.42,width:panel.width,height:.58}
+      })
+    }
+
+    // 실제 한 장짜리 landscape 서식이 중앙을 가로지르는 경우를 위한 fallback.
+    // OCR 1차에서는 건너뛰고 split panel에서 못 찾았을 때만 사용한다.
+    if(spread){
+      regions.push({
+        id:`p${pageIndex}-wide-upper`,
+        pageIndex,
+        priority:priority++,
+        rect:{x:0,y:0,width:1,height:.58}
       })
       regions.push({
-        id:`p${pageIndex}-full`,
+        id:`p${pageIndex}-wide-lower`,
         pageIndex,
         priority:priority++,
-        rect:{x:0,y:0,width:1,height:1}
+        rect:{x:0,y:.42,width:1,height:.58}
       })
     }
   }
 
   return regions
 }
-
 
 async function renderPdfPage(
   page:PDFPageProxy,
@@ -155,7 +146,8 @@ async function renderPdfPage(
 
   await page.render({
     canvasContext:ctx,
-    viewport:vp
+    viewport:vp,
+    canvas
   }).promise
 
   return canvas

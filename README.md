@@ -1,5 +1,5 @@
-# Signature Detector Batch v13.1
-BUILD 13.1 · 2026-08-12
+# Signature Detector Batch v13.2
+BUILD 13.2 · 2026-08-12
 
 ## 사용자 목표 재정의
 
@@ -69,7 +69,7 @@ OCR이 날짜 한 글자를 놓치더라도
 탐지한 작성 영역만 약 40px margin과 함께 원본 품질로 크게 표시합니다.
 
 
-## v13.1 자체 점검 추가
+## v13.2 자체 점검 추가
 
 - PDF.js ROI offset-render 방식을 제거하고 페이지를 1회 정상 렌더한 뒤 crop하도록 변경.
 - 한 페이지의 여러 검색 ROI는 같은 page canvas를 재사용.
