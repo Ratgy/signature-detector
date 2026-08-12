@@ -12,16 +12,15 @@ export interface OCRToken {
   pageIndex:number
 }
 
-export interface SearchRegion {
+export interface StripSpec {
   id:string
   pageIndex:number
   rect:Rect
-  priority:number
+  panelId:string
 }
 
 export interface TargetCandidate {
   pageIndex:number
-  region:Rect
   targetRect:Rect
   score:number
   confidence:number

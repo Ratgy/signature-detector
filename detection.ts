@@ -1,4 +1,8 @@
-import type { OCRToken, Rect, TargetCandidate } from './types'
+import type {
+  OCRToken,
+  Rect,
+  TargetCandidate
+} from './types'
 
 const clean=(s:string)=>
   s.replace(/\s+/g,'')
@@ -7,31 +11,48 @@ const clean=(s:string)=>
 const cx=(r:Rect)=>r.x+r.width/2
 const cy=(r:Rect)=>r.y+r.height/2
 
-function union(rs:Rect[]):Rect{
-  const x0=Math.min(...rs.map(r=>r.x))
-  const y0=Math.min(...rs.map(r=>r.y))
-  const x1=Math.max(...rs.map(r=>r.x+r.width))
-  const y1=Math.max(...rs.map(r=>r.y+r.height))
-  return{x:x0,y:y0,width:x1-x0,height:y1-y0}
+function union(rects:Rect[]):Rect{
+  const x0=Math.min(...rects.map(r=>r.x))
+  const y0=Math.min(...rects.map(r=>r.y))
+  const x1=Math.max(...rects.map(r=>r.x+r.width))
+  const y1=Math.max(...rects.map(r=>r.y+r.height))
+
+  return{
+    x:x0,
+    y:y0,
+    width:x1-x0,
+    height:y1-y0
+  }
 }
 
 function lev(a:string,b:string){
-  const aa=clean(a),bb=clean(b)
+  const aa=clean(a)
+  const bb=clean(b)
+
   const dp=Array.from(
     {length:aa.length+1},
     ()=>Array(bb.length+1).fill(0)
   )
 
-  for(let i=0;i<=aa.length;i++)dp[i][0]=i
-  for(let j=0;j<=bb.length;j++)dp[0][j]=j
+  for(let i=0;i<=aa.length;i++){
+    dp[i][0]=i
+  }
+
+  for(let j=0;j<=bb.length;j++){
+    dp[0][j]=j
+  }
 
   for(let i=1;i<=aa.length;i++){
     for(let j=1;j<=bb.length;j++){
-      const c=aa[i-1]===bb[j-1]?0:1
+      const cost=
+        aa[i-1]===bb[j-1]
+          ?0
+          :1
+
       dp[i][j]=Math.min(
         dp[i-1][j]+1,
         dp[i][j-1]+1,
-        dp[i-1][j-1]+c
+        dp[i-1][j-1]+cost
       )
     }
   }
@@ -40,60 +61,118 @@ function lev(a:string,b:string){
 }
 
 function sim(a:string,b:string){
-  const aa=clean(a),bb=clean(b)
+  const aa=clean(a)
+  const bb=clean(b)
+
   if(!aa||!bb)return 0
   if(aa===bb)return 1
-  if(aa.includes(bb)||bb.includes(aa)){
+
+  if(
+    aa.includes(bb)||
+    bb.includes(aa)
+  ){
     return Math.min(
       .99,
-      .76+
+      .77+
       Math.min(aa.length,bb.length)/
-      Math.max(aa.length,bb.length)*.22
+      Math.max(aa.length,bb.length)*
+      .2
     )
   }
-  return 1-lev(aa,bb)/Math.max(aa.length,bb.length)
+
+  return(
+    1-
+    lev(aa,bb)/
+    Math.max(aa.length,bb.length)
+  )
 }
 
-function buildLines(tokens:OCRToken[]){
+interface OCRLine {
+  tokens:OCRToken[]
+  text:string
+  rect:Rect
+}
+
+function buildLines(
+  tokens:OCRToken[]
+):OCRLine[]{
   const sorted=[...tokens].sort(
-    (a,b)=>cy(a.rect)-cy(b.rect)||a.rect.x-b.rect.x
+    (a,b)=>
+      cy(a.rect)-cy(b.rect)||
+      a.rect.x-b.rect.x
   )
 
   const groups:OCRToken[][]=[]
 
   for(const token of sorted){
-    let best:OCRToken[]|null=null
+    let selected:OCRToken[]|null=null
     let bestDy=Infinity
 
     for(const group of groups){
-      const gy=group.reduce((s,t)=>s+cy(t.rect),0)/group.length
-      const avgH=group.reduce((s,t)=>s+t.rect.height,0)/group.length
-      const dy=Math.abs(cy(token.rect)-gy)
+      const groupY=
+        group.reduce(
+          (sum,t)=>sum+cy(t.rect),
+          0
+        )/
+        group.length
 
-      if(dy<Math.max(.014,avgH*.82)&&dy<bestDy){
-        best=group
+      const avgHeight=
+        group.reduce(
+          (sum,t)=>sum+t.rect.height,
+          0
+        )/
+        group.length
+
+      const dy=
+        Math.abs(
+          cy(token.rect)-groupY
+        )
+
+      if(
+        dy<
+          Math.max(
+            .012,
+            avgHeight*.8
+          ) &&
+        dy<bestDy
+      ){
+        selected=group
         bestDy=dy
       }
     }
 
-    if(best)best.push(token)
-    else groups.push([token])
+    if(selected){
+      selected.push(token)
+    }else{
+      groups.push([token])
+    }
   }
 
-  return groups.map(tokens=>({
-    tokens:[...tokens].sort((a,b)=>a.rect.x-b.rect.x),
-    rect:union(tokens.map(t=>t.rect)),
-    text:[...tokens]
-      .sort((a,b)=>a.rect.x-b.rect.x)
-      .map(t=>t.text)
-      .join(' ')
-  }))
+  return groups.map(group=>{
+    const ordered=
+      [...group].sort(
+        (a,b)=>a.rect.x-b.rect.x
+      )
+
+    return{
+      tokens:ordered,
+      text:
+        ordered
+          .map(t=>t.text)
+          .join(' '),
+      rect:
+        union(
+          ordered.map(t=>t.rect)
+        )
+    }
+  })
 }
 
-
-function expandedTokens(tokens:OCRToken[]){
+function expandedTokens(
+  tokens:OCRToken[]
+){
   const lines=buildLines(tokens)
-  const out=[...tokens]
+  const expanded=[...tokens]
 
   for(const line of lines){
     const ts=line.tokens
@@ -101,369 +180,595 @@ function expandedTokens(tokens:OCRToken[]){
     for(let i=0;i<ts.length;i++){
       for(
         let len=2;
-        len<=5 && i+len<=ts.length;
+        len<=6 &&
+        i+len<=ts.length;
         len++
       ){
-        const group=ts.slice(i,i+len)
+        const group=
+          ts.slice(i,i+len)
 
-        // 단어 사이가 너무 먼 경우 같은 phrase로 합치지 않는다.
-        const badGap=group
-          .slice(1)
-          .some((t,k)=>
-            t.rect.x-
-            (
-              group[k].rect.x+
-              group[k].rect.width
-            )>.07
-          )
+        const badGap=
+          group
+            .slice(1)
+            .some(
+              (token,k)=>
+                token.rect.x-
+                (
+                  group[k].rect.x+
+                  group[k].rect.width
+                )>.065
+            )
 
         if(badGap)break
 
-        const rect=union(
-          group.map(t=>t.rect)
-        )
-
-        out.push({
-          text:group.map(t=>t.text).join(''),
-          confidence:Math.min(
-            ...group.map(t=>t.confidence)
-          ),
-          pageIndex:group[0].pageIndex,
-          rect
+        expanded.push({
+          text:
+            group
+              .map(t=>t.text)
+              .join(''),
+          confidence:
+            Math.min(
+              ...group.map(
+                t=>t.confidence
+              )
+            ),
+          pageIndex:
+            group[0].pageIndex,
+          rect:
+            union(
+              group.map(t=>t.rect)
+            )
         })
       }
     }
   }
 
-  return out
+  return expanded
 }
 
-function tokenBuyerScore(text:string){
+function buyerScore(text:string){
   const s=clean(text)
-  if(s.includes('매수인'))return 1
+
+  if(s.includes('매수인')){
+    return 1
+  }
+
   return sim(s,'매수인')
 }
 
-function tokenSignScore(text:string){
+function signerScore(text:string){
+  const raw=text
   const s=clean(text)
-  if(s.includes('서명또는인'))return 1
-  if(s.includes('서명'))return .95
-  if(s==='인')return .55
-  return Math.max(sim(s,'서명'),sim(s,'서명또는인'))
+
+  if(s.includes('서명또는인')){
+    return 1
+  }
+
+  if(s.includes('서명')){
+    return .96
+  }
+
+  if(
+    raw.includes('(인)')||
+    raw.includes('（인）')||
+    raw.includes('[인]')
+  ){
+    return .82
+  }
+
+  // '인' 한 글자만으로는 서명란을 만들지 않는다.
+  if(s==='인'){
+    return .18
+  }
+
+  return Math.max(
+    sim(s,'서명')*.9,
+    sim(s,'서명또는인')
+  )
 }
 
-function tokenConfirmScore(text:string){
+function confirmScore(text:string){
   const s=clean(text)
   let score=0
-  if(s.includes('확인'))score=.8
-  if(s.includes('본인은'))score=Math.max(score,.65)
-  if(s.includes('사실'))score=Math.max(score,.45)
-  return Math.max(score,sim(s,'확인합니다')*.8)
+
+  if(s.includes('확인')){
+    score=Math.max(score,.82)
+  }
+
+  if(s.includes('본인은')){
+    score=Math.max(score,.7)
+  }
+
+  if(s.includes('사실')){
+    score=Math.max(score,.5)
+  }
+
+  return Math.max(
+    score,
+    sim(s,'확인합니다')*.78
+  )
 }
 
-function isDateUnit(text:string,unit:'년'|'월'|'일'){
+function exactDateUnit(
+  text:string,
+  unit:'년'|'월'|'일'
+){
   const s=clean(text)
-  if(s===unit)return true
-  // '연' 오인식은 년으로만 제한적으로 허용.
-  if(unit==='년'&&s==='연')return true
-  return sim(s,unit)>=.78
-}
 
-function findBlankDateCluster(tokens:OCRToken[]){
-  const years=tokens.filter(t=>isDateUnit(t.text,'년'))
-  const months=tokens.filter(t=>isDateUnit(t.text,'월'))
-  const days=tokens.filter(t=>isDateUnit(t.text,'일'))
-
-  const clusters:{tokens:OCRToken[];rect:Rect;score:number}[]=[]
-
-  for(const y of years){
-    const yy=cy(y.rect)
-
-    const m=months
-      .filter(t=>
-        Math.abs(cy(t.rect)-yy)<.04 &&
-        cx(t.rect)>cx(y.rect)
+  if(unit==='년'){
+    return(
+      s==='년'||
+      s==='연'||
+      (
+        s.length<=2 &&
+        s.includes('년')
       )
-      .sort((a,b)=>cx(a.rect)-cx(b.rect))[0]
-
-    if(!m)continue
-
-    const d=days
-      .filter(t=>
-        Math.abs(cy(t.rect)-yy)<.04 &&
-        cx(t.rect)>cx(m.rect)
-      )
-      .sort((a,b)=>cx(a.rect)-cx(b.rect))[0]
-
-    if(!d)continue
-
-    const rect=union([y.rect,m.rect,d.rect])
-
-    // 사용자 요구: 년/월/일 사이에 숫자가 하나라도 있으면 이미 작성된 날짜.
-    const between=tokens.filter(t=>{
-      const x=cx(t.rect)
-      return Math.abs(cy(t.rect)-yy)<.045 &&
-        x>=y.rect.x &&
-        x<=d.rect.x+d.rect.width
-    })
-
-    if(between.some(t=>/\d/.test(t.text)))continue
-
-    clusters.push({
-      tokens:[y,m,d],
-      rect,
-      score:100-
-        Math.max(
-          Math.abs(cy(y.rect)-cy(m.rect)),
-          Math.abs(cy(y.rect)-cy(d.rect))
-        )*600
-    })
+    )
   }
 
-  // OCR이 '년 월 일'을 하나의 token/line으로 합친 경우.
-  for(const t of tokens){
-    const s=clean(t.text)
-    if(/\d/.test(s))continue
-    if(s.includes('년월일')||s.includes('연월일')){
-      clusters.push({
-        tokens:[t],
-        rect:t.rect,
-        score:88
-      })
-    }
-  }
-
-  return clusters.sort((a,b)=>b.score-a.score)
+  return(
+    s===unit||
+    (
+      s.length<=2 &&
+      s.includes(unit)
+    )
+  )
 }
 
-function findBuyerAndSigner(lines:ReturnType<typeof buildLines>){
-  const pairs:{
-    buyer:OCRToken
-    signer:OCRToken|null
-    lineRect:Rect
-    score:number
-  }[]=[]
+interface DateCluster {
+  tokens:OCRToken[]
+  rect:Rect
+  score:number
+  complete:boolean
+}
+
+function blankDateClusters(
+  tokens:OCRToken[]
+):DateCluster[]{
+  const lines=buildLines(tokens)
+  const clusters:DateCluster[]=[]
 
   for(const line of lines){
-    const buyers=line.tokens
-      .map(t=>({token:t,score:tokenBuyerScore(t.text)}))
-      .filter(x=>x.score>=.44)
-      .sort((a,b)=>b.score-a.score)
+    const lineTokens=line.tokens
+    const noDigitTokens=
+      lineTokens.filter(
+        t=>!/\d/.test(t.text)
+      )
 
-    if(!buyers.length)continue
+    const years=
+      noDigitTokens.filter(
+        t=>exactDateUnit(t.text,'년')
+      )
+    const months=
+      noDigitTokens.filter(
+        t=>exactDateUnit(t.text,'월')
+      )
+    const days=
+      noDigitTokens.filter(
+        t=>exactDateUnit(t.text,'일')
+      )
 
-    const signs=line.tokens
-      .map(t=>({token:t,score:tokenSignScore(t.text)}))
-      .filter(x=>x.score>=.43)
-      .sort((a,b)=>b.score-a.score)
+    for(const year of years){
+      const month=
+        months
+          .filter(
+            t=>
+              cx(t.rect)>
+                cx(year.rect) &&
+              Math.abs(
+                cy(t.rect)-
+                cy(year.rect)
+              )<.035
+          )
+          .sort(
+            (a,b)=>
+              cx(a.rect)-cx(b.rect)
+          )[0]
 
-    for(const b of buyers){
-      // '인' 단독은 매수인 근처일 때만 signer로 인정.
-      let signer=signs.find(s=>{
-        if(clean(s.token.text)!=='인')return true
-        return Math.abs(cx(s.token.rect)-cx(b.token.rect))<.35
-      })?.token ?? null
+      if(!month)continue
 
-      let score=b.score*80
-      if(signer)score+=tokenSignScore(signer.text)*55
+      const day=
+        days
+          .filter(
+            t=>
+              cx(t.rect)>
+                cx(month.rect) &&
+              Math.abs(
+                cy(t.rect)-
+                cy(year.rect)
+              )<.035
+          )
+          .sort(
+            (a,b)=>
+              cx(a.rect)-cx(b.rect)
+          )[0]
 
-      pairs.push({
-        buyer:b.token,
-        signer,
-        lineRect:line.rect,
-        score
+      if(day){
+        const dateRect=
+          union([
+            year.rect,
+            month.rect,
+            day.rect
+          ])
+
+        const between=
+          lineTokens.filter(t=>{
+            const x=cx(t.rect)
+
+            return(
+              x>=year.rect.x &&
+              x<=
+                day.rect.x+
+                day.rect.width
+            )
+          })
+
+        // 핵심 요구사항:
+        // 년-월-일 사이에 숫자가 있으면 이미 작성된 날짜.
+        if(
+          between.some(
+            t=>/\d/.test(t.text)
+          )
+        ){
+          continue
+        }
+
+        clusters.push({
+          tokens:[
+            year,
+            month,
+            day
+          ],
+          rect:dateRect,
+          score:115,
+          complete:true
+        })
+
+        continue
+      }
+
+      // 2/3 날짜 단위 fallback.
+      // 이 자체만으로는 성공할 수 없고,
+      // 매수인+서명+확인 문맥이 모두 필요하다.
+      const partialRect=
+        union([
+          year.rect,
+          month.rect
+        ])
+
+      clusters.push({
+        tokens:[
+          year,
+          month
+        ],
+        rect:partialRect,
+        score:58,
+        complete:false
       })
+    }
+
+    // OCR이 "년 월 일"을 하나로 합친 경우.
+    for(const token of lineTokens){
+      const s=clean(token.text)
+
+      if(/\d/.test(s)){
+        continue
+      }
+
+      const y=s.indexOf('년')>=0
+        ?s.indexOf('년')
+        :s.indexOf('연')
+      const m=s.indexOf('월')
+      const d=s.indexOf('일')
+
+      if(
+        y>=0 &&
+        m>y &&
+        d>m
+      ){
+        clusters.push({
+          tokens:[token],
+          rect:token.rect,
+          score:110,
+          complete:true
+        })
+      }
     }
   }
 
-  return pairs.sort((a,b)=>b.score-a.score)
+  return clusters
+}
+
+function buyerCandidates(
+  tokens:OCRToken[]
+){
+  return tokens
+    .map(token=>({
+      token,
+      score:
+        buyerScore(token.text)
+    }))
+    .filter(
+      item=>item.score>=.52
+    )
+    .sort(
+      (a,b)=>b.score-a.score
+    )
+}
+
+function bestSigner(
+  tokens:OCRToken[],
+  buyer:OCRToken
+){
+  return tokens
+    .map(token=>({
+      token,
+      score:
+        signerScore(token.text)
+    }))
+    .filter(
+      item=>
+        item.score>=.52 &&
+        Math.abs(
+          cy(item.token.rect)-
+          cy(buyer.rect)
+        )<.11
+    )
+    .sort(
+      (a,b)=>b.score-a.score
+    )[0]
+}
+
+function bestConfirmation(
+  lines:OCRLine[],
+  targetY:number
+){
+  return lines
+    .map(line=>({
+      line,
+      score:
+        Math.max(
+          confirmScore(line.text),
+          ...line.tokens.map(
+            t=>confirmScore(t.text)
+          )
+        )
+    }))
+    .filter(item=>{
+      const diff=
+        targetY-
+        cy(item.line.rect)
+
+      return(
+        item.score>=.38 &&
+        diff>=-.03 &&
+        diff<=.30
+      )
+    })
+    .sort(
+      (a,b)=>b.score-a.score
+    )[0]
 }
 
 export function detectTarget(
   tokens:OCRToken[],
   pageIndex:number,
-  regionRect:Rect
+  stripRect:Rect
 ):TargetCandidate|null{
-  if(!tokens.length)return null
+  if(!tokens.length){
+    return null
+  }
 
-  const expanded=expandedTokens(tokens)
-  const lines=buildLines(expanded)
-  const dates=findBlankDateCluster(expanded)
-  const buyerPairs=findBuyerAndSigner(lines)
+  const expanded=
+    expandedTokens(tokens)
+
+  const lines=
+    buildLines(expanded)
+
+  const dates=
+    blankDateClusters(expanded)
+
+  const buyers=
+    buyerCandidates(expanded)
+
+  if(
+    !dates.length||
+    !buyers.length
+  ){
+    return null
+  }
 
   let best:TargetCandidate|null=null
 
   for(const date of dates){
     const dateY=cy(date.rect)
 
-    for(const pair of buyerPairs){
-      const buyerY=cy(pair.buyer.rect)
-      const dy=Math.abs(dateY-buyerY)
+    for(const buyer of buyers){
+      const buyerY=cy(buyer.token.rect)
 
-      // 같은 작성 행 또는 바로 인접한 행만 허용.
-      if(dy>.115)continue
+      if(
+        Math.abs(
+          dateY-buyerY
+        )>.12
+      ){
+        continue
+      }
 
-      const parts=[date.rect,pair.buyer.rect]
-      if(pair.signer)parts.push(pair.signer.rect)
+      const signer=
+        bestSigner(
+          expanded,
+          buyer.token
+        )
 
-      const local=union(parts)
-
-      // 이 검사는 이미 논리 페이지/ROI 내부에서 수행된다.
-      // 따라서 서명블록 자체가 ROI의 절반 이상을 차지하면 오탐으로 본다.
-      if(local.width>.72||local.height>.22)continue
-
-      // blank date와 매수인이 너무 멀면 다른 줄을 섞은 것.
-      if(Math.abs(cx(date.rect)-cx(pair.buyer.rect))>.48)continue
-
-      // confirmation 문장은 후보 위쪽 근처에 있으면 가점만.
-      const confirm=lines
-        .map(line=>({
-          line,
-          score:Math.max(
-            ...line.tokens.map(t=>tokenConfirmScore(t.text)),
-            tokenConfirmScore(line.text)
+      const confirmation=
+        bestConfirmation(
+          lines,
+          Math.max(
+            dateY,
+            buyerY
           )
-        }))
-        .filter(x=>{
-          const diff=dateY-cy(x.line.rect)
-          return x.score>=.35 && diff>=-.02 && diff<=.28
-        })
-        .sort((a,b)=>b.score-a.score)[0]
+        )
 
-      let score=150+date.score+pair.score
-      if(pair.signer)score+=35
-      if(confirm)score+=confirm.score*35
+      if(
+        date.complete &&
+        !signer &&
+        !confirmation
+      ){
+        continue
+      }
 
-      // 하단에 있는 빈 매수인 서명란을 우선.
-      score+=dateY*35
+      if(
+        !date.complete &&
+        (
+          !signer||
+          !confirmation
+        )
+      ){
+        continue
+      }
 
-      // target crop: 확인 문장은 제외하고 실제 작성영역만.
-      let target=local
+      const rects=[
+        date.rect,
+        buyer.token.rect
+      ]
 
-      // 서명 OCR은 성공했지만 실제 사인 공간은 텍스트 오른쪽에 더 있다.
-      // 매수인/서명 위치 기준으로 작성 여백까지 포함한다.
+      if(signer){
+        rects.push(
+          signer.token.rect
+        )
+      }
+
+      const local=
+        union(rects)
+
+      if(
+        local.width>.82||
+        local.height>.18
+      ){
+        continue
+      }
+
+      if(
+        Math.abs(
+          cx(date.rect)-
+          cx(buyer.token.rect)
+        )>.42
+      ){
+        continue
+      }
+
+      let score=
+        date.score+
+        buyer.score*95
+
+      if(signer){
+        score+=
+          signer.score*75
+      }
+
+      if(confirmation){
+        score+=
+          confirmation.score*28
+      }
+
+      if(date.complete){
+        score+=50
+      }
+
       const left=Math.max(
         0,
-        Math.min(date.rect.x,pair.buyer.rect.x)-.045
+        Math.min(
+          date.rect.x,
+          buyer.token.rect.x
+        )-.055
       )
+
+      const signerRight=
+        signer
+          ?signer.token.rect.x+
+            signer.token.rect.width
+          :buyer.token.rect.x+
+            buyer.token.rect.width
+
       const right=Math.min(
         1,
         Math.max(
-          date.rect.x+date.rect.width,
-          pair.signer
-            ?pair.signer.rect.x+pair.signer.rect.width+.15
-            :pair.buyer.rect.x+pair.buyer.rect.width+.24
+          date.rect.x+
+            date.rect.width,
+          signerRight
+        )+
+        (
+          signer
+            ?.12
+            :.22
         )
       )
-      const top=Math.max(0,target.y-.035)
-      const bottom=Math.min(
-        1,
-        target.y+target.height+.045
+
+      const top=Math.max(
+        0,
+        local.y-.04
       )
 
-      target={
+      const bottom=Math.min(
+        1,
+        local.y+
+        local.height+
+        .055
+      )
+
+      const targetLocal={
         x:left,
         y:top,
-        width:right-left,
-        height:bottom-top
+        width:
+          Math.max(
+            .18,
+            right-left
+          ),
+        height:
+          Math.max(
+            .07,
+            bottom-top
+          )
       }
 
       const candidate:TargetCandidate={
         pageIndex,
-        region:regionRect,
         targetRect:{
-          x:regionRect.x+target.x*regionRect.width,
-          y:regionRect.y+target.y*regionRect.height,
-          width:target.width*regionRect.width,
-          height:target.height*regionRect.height
+          x:
+            stripRect.x+
+            targetLocal.x*
+            stripRect.width,
+          y:
+            stripRect.y+
+            targetLocal.y*
+            stripRect.height,
+          width:
+            targetLocal.width*
+            stripRect.width,
+          height:
+            targetLocal.height*
+            stripRect.height
         },
         score,
-        confidence:Math.max(
-          .45,
-          Math.min(.99,score/330)
-        )
+        confidence:
+          Math.max(
+            .55,
+            Math.min(
+              .99,
+              score/325
+            )
+          )
       }
 
-      if(!best||candidate.score>best.score){
+      if(
+        !best||
+        candidate.score>
+          best.score
+      ){
         best=candidate
       }
     }
   }
 
-  // OCR이 년/월/일 중 하나를 놓친 경우:
-  // 매수인 + 서명 + 확인문장이 강하게 잡히면 row 자체를 fallback 후보로 인정.
-  if(!best){
-    for(const pair of buyerPairs){
-      if(!pair.signer)continue
-
-      const y=cy(pair.lineRect)
-      const confirm=lines
-        .map(line=>({
-          line,
-          score:tokenConfirmScore(line.text)
-        }))
-        .filter(x=>{
-          const diff=y-cy(x.line.rect)
-          return x.score>=.45&&diff>=-.02&&diff<=.24
-        })
-        .sort((a,b)=>b.score-a.score)[0]
-
-      if(!confirm)continue
-
-      // 숫자가 같은 줄에 많으면 이미 작성된 검사자 영역 가능성이 높으므로 제외.
-      const row=lines.find(l=>
-        Math.abs(cy(l.rect)-cy(pair.lineRect))<.006 &&
-        Math.abs(l.rect.x-pair.lineRect.x)<.006
-      )
-      if((row?.tokens ?? []).some(t=>/\d{2,}/.test(t.text)))continue
-
-      const left=Math.max(0,pair.lineRect.x-.36)
-      const right=Math.min(
-        1,
-        (pair.signer.rect.x+pair.signer.rect.width)+.16
-      )
-
-      const local={
-        x:left,
-        y:Math.max(0,pair.lineRect.y-.035),
-        width:right-left,
-        height:Math.min(.16,pair.lineRect.height+.075)
-      }
-
-      const score=190+pair.score+confirm.score*25+y*30
-
-      best={
-        pageIndex,
-        region:regionRect,
-        targetRect:{
-          x:regionRect.x+local.x*regionRect.width,
-          y:regionRect.y+local.y*regionRect.height,
-          width:local.width*regionRect.width,
-          height:local.height*regionRect.height
-        },
-        score,
-        confidence:Math.min(.88,score/330)
-      }
-    }
-  }
-
   return best
-}
-
-
-export function scoreRegionHints(tokens:OCRToken[]){
-  const expanded=expandedTokens(tokens)
-  let buyer=0,sign=0,date=0,confirm=0
-
-  for(const t of expanded){
-    buyer=Math.max(buyer,tokenBuyerScore(t.text))
-    sign=Math.max(sign,tokenSignScore(t.text))
-    confirm=Math.max(confirm,tokenConfirmScore(t.text))
-  }
-
-  const dates=findBlankDateCluster(expanded)
-  if(dates.length)date=Math.min(1,dates[0].score/100)
-
-  // 매수인/서명/빈 날짜를 가장 강하게 보고 확인 문구는 보조로만 사용.
-  return buyer*42+sign*34+date*48+confirm*10
 }

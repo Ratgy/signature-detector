@@ -53,3 +53,16 @@
   object-fit:contain;
   display:block;
 }
+
+.v14Crop{
+  min-height:220px;
+  padding:14px;
+  background:#f2f2f2;
+}
+.v14Crop img{
+  display:block;
+  width:100%;
+  height:auto;
+  max-height:640px;
+  object-fit:contain;
+}

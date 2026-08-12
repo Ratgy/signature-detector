@@ -1,18 +1,17 @@
 import { createWorker, PSM } from 'tesseract.js'
 import type { OCRToken } from './types'
 
-let workerPromise: ReturnType<typeof createWorker> | null = null
-let progressHandler: ((p:number,s:string)=>void) | undefined
+let workerPromise:ReturnType<typeof createWorker>|null=null
+let progressCb:((p:number,s:string)=>void)|undefined
 
-async function getWorker(onProgress?: (p:number,s:string)=>void) {
-  progressHandler=onProgress
+async function getWorker(onProgress?:(p:number,s:string)=>void){
+  progressCb=onProgress
 
   if(!workerPromise){
-    // v13: target words are Korean. Loading only kor reduces model/setup overhead.
-    workerPromise=createWorker('kor', undefined, {
+    workerPromise=createWorker('kor',undefined,{
       logger:(m:any)=>{
         if(typeof m.progress==='number'){
-          progressHandler?.(m.progress,m.status ?? 'OCR')
+          progressCb?.(m.progress,m.status ?? 'OCR')
         }
       }
     })
@@ -21,15 +20,34 @@ async function getWorker(onProgress?: (p:number,s:string)=>void) {
     await worker.setParameters({
       preserve_interword_spaces:'1',
       user_defined_dpi:'300',
-      tessedit_pageseg_mode:PSM.SINGLE_BLOCK,
+      tessedit_pageseg_mode:PSM.SPARSE_TEXT
     } as any)
+
     return worker
   }
 
   return workerPromise
 }
 
-function extractWords(result:any, pageIndex:number, width:number, height:number):OCRToken[]{
+export async function recognizeContactSheet(
+  canvas:HTMLCanvasElement,
+  pageIndex:number,
+  onProgress?:(p:number,s:string)=>void
+):Promise<OCRToken[]>{
+  const worker=await getWorker(onProgress)
+
+  await worker.setParameters({
+    preserve_interword_spaces:'1',
+    user_defined_dpi:'300',
+    tessedit_pageseg_mode:PSM.SPARSE_TEXT
+  } as any)
+
+  const result:any=await worker.recognize(
+    canvas,
+    {},
+    {blocks:true,text:true}
+  )
+
   const words:any[]=[]
 
   for(const block of result.data?.blocks ?? []){
@@ -49,35 +67,12 @@ function extractWords(result:any, pageIndex:number, width:number, height:number)
       confidence:Number(w.confidence ?? 0),
       pageIndex,
       rect:{
-        x:w.bbox.x0/width,
-        y:w.bbox.y0/height,
-        width:(w.bbox.x1-w.bbox.x0)/width,
-        height:(w.bbox.y1-w.bbox.y0)/height,
+        x:w.bbox.x0/canvas.width,
+        y:w.bbox.y0/canvas.height,
+        width:(w.bbox.x1-w.bbox.x0)/canvas.width,
+        height:(w.bbox.y1-w.bbox.y0)/canvas.height
       }
     }))
-}
-
-export async function recognizeRegion(
-  canvas:HTMLCanvasElement,
-  pageIndex:number,
-  onProgress?: (p:number,s:string)=>void,
-  sparse=false
-):Promise<OCRToken[]>{
-  const worker=await getWorker(onProgress)
-
-  await worker.setParameters({
-    preserve_interword_spaces:'1',
-    user_defined_dpi:'300',
-    tessedit_pageseg_mode:sparse ? PSM.SPARSE_TEXT : PSM.SINGLE_BLOCK,
-  } as any)
-
-  const result:any=await worker.recognize(
-    canvas,
-    {},
-    {blocks:true,text:true}
-  )
-
-  return extractWords(result,pageIndex,canvas.width,canvas.height)
 }
 
 export async function terminateOCR(){
