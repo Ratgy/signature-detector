@@ -106,13 +106,16 @@ function looksPrefilled(text:string){
   return /\d{4}년?\d{1,2}월?\d{1,2}일?/.test(s) || /\d{4}[-./]\d{1,2}[-./]\d{1,2}/.test(s)
 }
 
-function createCrop(lines:OCRLine[]){
-  const core=union(lines.map(l=>l.rect))
+function createTargetCrop(dateLine:OCRLine,buyerLine:OCRLine,signerLine:OCRLine){
+  // Confirmation text is only a semantic anchor.
+  // Final result must show only the actual fill/sign row.
+  const core=union([dateLine.rect,buyerLine.rect,signerLine.rect])
+
   return clamp({
-    x:Math.max(0,core.x-.06),
-    y:Math.max(0,core.y-.045),
-    width:Math.min(.96,Math.max(.52,core.width+.12)),
-    height:Math.min(.30,Math.max(.12,core.height+.09))
+    x:Math.max(0,core.x-.035),
+    y:Math.max(0,core.y-.025),
+    width:Math.min(.94,Math.max(.42,core.width+.07)),
+    height:Math.min(.16,Math.max(.075,core.height+.05))
   })
 }
 
@@ -169,7 +172,7 @@ export function detectSigningBlocks(tokens:OCRToken[]):SigningBlock[]{
           // Prefer the lower valid acknowledgement block if multiple exist.
           score+=targetY*28
 
-          const crop=createCrop([c.line,d.line,b.line,s.line])
+          const crop=createTargetCrop(d.line,b.line,s.line)
           candidates.push({
             pageIndex:c.line.pageIndex,
             rect:crop,
@@ -213,7 +216,7 @@ export function detectSigningBlocks(tokens:OCRToken[]):SigningBlock[]{
         const score=235+c.score*35+yY*25
         candidates.push({
           pageIndex:y.pageIndex,
-          rect:createCrop(pseudoLines),
+          rect:createTargetCrop(pseudoLines[1],pseudoLines[2],pseudoLines[3]),
           confidence:Math.min(.94,score/300),
           score,
           confirmLine:c.line.text,
@@ -230,14 +233,23 @@ export function detectSigningBlocks(tokens:OCRToken[]):SigningBlock[]{
 export function scoreFastPageText(text:string){
   const s=clean(text)
   let score=0
-  // Loose page selection, never exact-match-only.
-  if(s.includes('확인'))score+=65
-  if(s.includes('사실'))score+=18
-  if(s.includes('본인은'))score+=22
-  if(s.includes('매수인'))score+=52
-  if(s.includes('서명'))score+=38
-  if((s.includes('년')&&s.includes('월')&&s.includes('일'))||s.includes('연월일')||s.includes('년월일'))score+=48
-  // Desired buyer row combination
-  if(s.includes('매수인')&&(s.includes('서명')||s.includes('인')))score+=45
+
+  const hasConfirm=s.includes('확인')||s.includes('사실')||s.includes('본인은')
+  const hasDate=(s.includes('년')&&s.includes('월')&&s.includes('일'))||
+    s.includes('연월일')||s.includes('년월일')
+  const hasBuyer=s.includes('매수인')
+  const hasSign=s.includes('서명')||s.includes('서명또는인')||s.includes('(인)')
+
+  if(hasConfirm)score+=28
+  if(hasDate)score+=70
+  if(hasBuyer)score+=90
+  if(hasSign)score+=72
+
+  // Strong page discriminator: the real target page normally contains this combination.
+  if(hasDate&&hasBuyer)score+=85
+  if(hasBuyer&&hasSign)score+=95
+  if(hasDate&&hasBuyer&&hasSign)score+=125
+  if(hasConfirm&&hasDate&&hasBuyer&&hasSign)score+=40
+
   return score
 }
