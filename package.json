@@ -1,7 +1,7 @@
 {
-  "name": "signature-detector-batch-v18",
+  "name": "signature-detector-batch-v24",
   "private": true,
-  "version": "1.8.0",
+  "version": "2.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

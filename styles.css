@@ -181,3 +181,84 @@
     min-height:20px;
   }
 }
+
+
+/* v20: 최종 사용자 플로우 */
+.v20App{
+  max-width:760px;
+}
+.endUserCard{
+  overflow:hidden;
+}
+.simpleProgress{
+  display:grid;
+  grid-template-columns:1fr auto;
+  gap:12px;
+  align-items:center;
+}
+.simpleProgress>.progress{
+  grid-column:1/-1;
+}
+.userSigningFlow{
+  margin-top:0;
+}
+.userSigningFlow .editorSection{
+  margin-top:0;
+  padding-top:0;
+}
+.userSigningFlow .editorSection+
+.editorSection{
+  margin-top:28px;
+}
+.uprightDocument{
+  background:#f3f3f3;
+  border-radius:16px;
+  overflow:hidden;
+}
+.uprightDocument canvas{
+  display:block;
+  width:100%;
+  height:auto;
+}
+.v20SignatureCanvas{
+  /* 모바일 좌우 20px를 제외한 전체 폭 */
+  width:calc(100vw - 40px);
+  max-width:720px;
+  margin-left:50%;
+  transform:translateX(-50%);
+  border-radius:14px;
+  overflow:hidden;
+  background:#f3f3f3;
+  border:2px solid #FAC729;
+}
+.v20SignatureCanvas canvas{
+  display:block;
+  width:100%;
+  height:auto;
+  touch-action:none;
+  cursor:crosshair;
+}
+.simplifiedActions{
+  margin-top:12px;
+}
+.simplifiedActions button{
+  white-space:nowrap;
+}
+@media(max-width:600px){
+  .testHeader{
+    padding-left:2px;
+    padding-right:2px;
+  }
+  .endUserCard{
+    padding:20px;
+  }
+  .userSigningFlow .editorTitle h3{
+    font-size:24px;
+  }
+  .userSigningFlow .editorTitle span{
+    line-height:1.45;
+  }
+  .simplifiedActions{
+    align-items:flex-start;
+  }
+}
