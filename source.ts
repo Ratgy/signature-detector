@@ -157,6 +157,25 @@ export function rotateCanvas(
   return out
 }
 
+
+
+export async function renderOrientedPage(
+  src:LoadedSource,
+  pageIndex:number,
+  targetLongSide:number,
+  correction:0|90|180|270
+){
+  const page=await renderPage(
+    src,
+    pageIndex,
+    targetLongSide
+  )
+
+  return correction===0
+    ?page
+    :rotateCanvas(page,correction)
+}
+
 export function preprocess(
   source:HTMLCanvasElement,
   mode:'gray'|'adaptive'='gray'

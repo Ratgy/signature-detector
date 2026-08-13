@@ -6,7 +6,7 @@ import {
 } from 'react'
 
 import {assessTokens} from './detection'
-import {normalizeOrientation} from './orientation'
+import {detectOrientation} from './orientation'
 import {recognizePage,terminateOCR} from './ocr'
 import {
   buildFallbackRegions,
@@ -16,7 +16,7 @@ import {
   loadSource,
   mapLocalRectToPage,
   preprocess,
-  renderPage,
+  renderOrientedPage,
   tokensForMeta
 } from './source'
 
@@ -27,7 +27,7 @@ import type {
   TargetCandidate
 } from './types'
 
-const VERSION='16.0'
+const VERSION='17.0'
 const BUILD='2026-08-13'
 
 const makeId=()=>Math.random().toString(36).slice(2)
@@ -51,8 +51,8 @@ const emptyResult=(file:File):FileResult=>({
   elapsedMs:0,
   orientationCorrection:0,
   orientationConfidence:0,
-  normalizedUrl:null,
-  normalizedName:null
+  orientationOriginalPreview:null,
+  orientationCorrectedPreview:null
 })
 
 export default function App(){
@@ -179,30 +179,37 @@ export default function App(){
     update(index,{status:'processing',progress:1,message:'문서 준비 중'})
     startProgress(index)
 
-    const originalSrc=await loadSource(file)
-    const imageInput=originalSrc.type==='image'
-    update(index,{pageCount:originalSrc.pageCount,progress:4,message:'문자 방향 확인 중'})
-
-    // v16: 서명 탐지보다 먼저 문서 방향을 정규화한다.
-    const normalized=await normalizeOrientation(
-      file,
-      originalSrc,
-      (progress,message)=>update(index,{progress,message})
-    )
-    const normalizedUrl=URL.createObjectURL(normalized.blob)
-
+    const src=await loadSource(file)
+    const imageInput=src.type==='image'
     update(index,{
-      progress:33,
-      message:normalized.correction===0?'정방향 확인 완료':'문서 방향 보정 완료',
-      orientationCorrection:normalized.correction,
-      orientationConfidence:normalized.confidence,
-      normalizedUrl,
-      normalizedName:normalized.fileName,
-      pageCount:normalized.source.pageCount
+      pageCount:src.pageCount,
+      progress:4,
+      message:'문자 방향 확인 중'
     })
 
-    const src=normalized.source
-    update(index,{progress:35,message:'서명영역 탐색 중'})
+    // v17: 파일을 새로 저장하지 않는다.
+    // OCR로 필요한 회전각만 판단하고 이후 렌더링에 그 각도를 적용한다.
+    const orientation=await detectOrientation(
+      src,
+      (progress,message)=>update(index,{progress,message})
+    )
+
+    update(index,{
+      progress:25,
+      message:
+        orientation.correction===0
+          ?'정방향 확인 완료'
+          :'문자 방향에 맞춰 문서 보정 완료',
+      orientationCorrection:orientation.correction,
+      orientationConfidence:orientation.confidence,
+      orientationOriginalPreview:orientation.originalPreview,
+      orientationCorrectedPreview:orientation.correctedPreview
+    })
+
+    update(index,{
+      progress:27,
+      message:'서명영역 탐색 중'
+    })
 
     let best:TargetCandidate|null=null
     const pageHints:{pageIndex:number;hint:number}[]=[]
@@ -210,10 +217,11 @@ export default function App(){
 
     // 1차: 페이지당 OCR 딱 한 번. 기존 contact-sheet 4~8배 중복 OCR 제거.
     for(let pageIndex=0;pageIndex<src.pageCount;pageIndex++){
-      const page=await renderPage(
+      const page=await renderOrientedPage(
         src,
         pageIndex,
-        imageInput?1900:1600
+        imageInput?1750:1450,
+        orientation.correction
       )
       pageCache.set(pageIndex,page)
 
@@ -239,8 +247,11 @@ export default function App(){
         .slice(0,Math.min(2,src.pageCount))
 
       for(const candidate of candidates){
-        const page=pageCache.get(candidate.pageIndex)??await renderPage(
-          src,candidate.pageIndex,imageInput?2100:1750
+        const page=pageCache.get(candidate.pageIndex)??await renderOrientedPage(
+          src,
+          candidate.pageIndex,
+          imageInput?1950:1650,
+          orientation.correction
         )
         pageCache.set(candidate.pageIndex,page)
 
@@ -269,7 +280,12 @@ export default function App(){
     update(index,{progress:94,message:'서명영역 확대 중'})
 
     // 결과/편집용은 원본 톤으로 다시 렌더. 같은 좌표를 원본과 확대본이 공유한다.
-    const finalPage=await renderPage(src,best.pageIndex,1800)
+    const finalPage=await renderOrientedPage(
+      src,
+      best.pageIndex,
+      1800,
+      orientation.correction
+    )
     const cropRect=expandRectByPixels(finalPage,best.targetRect,40)
     const crop=cropPage(finalPage,cropRect,1600)
 
@@ -290,7 +306,6 @@ export default function App(){
 
   async function start(){
     if(!files.length||processing)return
-    results.forEach(r=>{if(r.normalizedUrl)URL.revokeObjectURL(r.normalizedUrl)})
     setProcessing(true)
     setResults(files.map(emptyResult))
 
@@ -324,7 +339,6 @@ export default function App(){
           name.endsWith('.png')
       })
       .slice(0,5)
-    results.forEach(r=>{if(r.normalizedUrl)URL.revokeObjectURL(r.normalizedUrl)})
     setFiles(selected)
     setResults([])
   }
@@ -347,11 +361,11 @@ export default function App(){
   return <div className="app">
     <header>
       <div>
-        <p className="eyebrow">OCR ORIENTATION NORMALIZE · LINKED SIGNATURE</p>
+        <p className="eyebrow">OCR ORIENTATION PREVIEW · LINKED SIGNATURE</p>
         <h1>서명영역 탐지 v{VERSION}</h1>
         <div className="versionBadge">BUILD {VERSION} · {BUILD}</div>
         <p className="sub">
-          OCR로 문자 방향을 먼저 정방향으로 맞춘 뒤 서명영역 탐지를 실행합니다.
+          문자 방향이 틀어진 문서만 화면에서 정방향으로 보정한 뒤 서명영역을 찾아 확대합니다.
         </p>
       </div>
     </header>
@@ -370,7 +384,7 @@ export default function App(){
       />
       <div className="uploadIcon">5</div>
       <strong>{files.length?`${files.length}개 파일 선택됨`:'PDF / JPG / PNG 최대 5개'}</strong>
-      <span>회전된 스캔도 먼저 정방향 파일로 보정한 뒤 서명영역을 찾습니다.</span>
+      <span>회전된 스캔은 저장하지 않고 OCR 문자 방향에 맞춰 화면에서만 보정합니다.</span>
     </section>
 
     {files.length>0&&<section className="batchList">
@@ -393,13 +407,46 @@ export default function App(){
         <div className="progress"><i style={{width:`${r.progress}%`}}/></div>
       </>}
 
-      {r.normalizedUrl&&<div className="orientationResult">
-        <div>
-          <span>문서 방향</span>
-          <strong>{r.orientationCorrection===0?'정방향':`${r.orientationCorrection}° 회전 보정`}</strong>
+      {r.orientationCorrection!==0&&
+        r.orientationOriginalPreview&&
+        r.orientationCorrectedPreview&&
+        <div className="orientationCompare">
+          <div className="orientationCompareHead">
+            <div>
+              <span>문서 방향 보정</span>
+              <strong>
+                OCR 문자 방향 기준 {r.orientationCorrection}° 회전
+              </strong>
+            </div>
+            <b>{Math.round(r.orientationConfidence)}%</b>
+          </div>
+
+          <div className="orientationCompareGrid">
+            <figure>
+              <figcaption>원본 방향</figcaption>
+              <img
+                src={r.orientationOriginalPreview}
+                alt="회전 전 원본"
+              />
+            </figure>
+
+            <div className="orientationArrow">→</div>
+
+            <figure>
+              <figcaption>문자 기준 정방향</figcaption>
+              <img
+                src={r.orientationCorrectedPreview}
+                alt="OCR 문자 방향으로 회전한 문서"
+              />
+            </figure>
+          </div>
+
+          <p>
+            원본 파일은 변경하거나 저장하지 않고,
+            아래 서명 탐지만 이 정방향을 기준으로 진행합니다.
+          </p>
         </div>
-        <a href={r.normalizedUrl} download={r.normalizedName??undefined}>정방향 파일 저장</a>
-      </div>}
+      }
 
       {r.status==='success'&&r.pagePreview&&r.cropPreview&&r.targetRect&&r.cropRect&&
         <LinkedSignatureEditor
