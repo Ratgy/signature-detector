@@ -27,7 +27,7 @@ import type {
   TargetCandidate
 } from './types'
 
-const VERSION='17.0'
+const VERSION='18.0'
 const BUILD='2026-08-13'
 
 const makeId=()=>Math.random().toString(36).slice(2)
@@ -51,6 +51,9 @@ const emptyResult=(file:File):FileResult=>({
   elapsedMs:0,
   orientationCorrection:0,
   orientationConfidence:0,
+  orientationDetectedAngle:null,
+  orientationSnappedAngle:null,
+  orientationVectorCount:0,
   orientationOriginalPreview:null,
   orientationCorrectedPreview:null
 })
@@ -202,6 +205,9 @@ export default function App(){
           :'문자 방향에 맞춰 문서 보정 완료',
       orientationCorrection:orientation.correction,
       orientationConfidence:orientation.confidence,
+      orientationDetectedAngle:orientation.detectedAngle,
+      orientationSnappedAngle:orientation.snappedTextAngle,
+      orientationVectorCount:orientation.vectorCount,
       orientationOriginalPreview:orientation.originalPreview,
       orientationCorrectedPreview:orientation.correctedPreview
     })
@@ -361,11 +367,11 @@ export default function App(){
   return <div className="app">
     <header>
       <div>
-        <p className="eyebrow">OCR ORIENTATION PREVIEW · LINKED SIGNATURE</p>
+        <p className="eyebrow">OCR CENTER ANGLE · QUARTER TURN · LINKED SIGNATURE</p>
         <h1>서명영역 탐지 v{VERSION}</h1>
         <div className="versionBadge">BUILD {VERSION} · {BUILD}</div>
         <p className="sub">
-          문자 방향이 틀어진 문서만 화면에서 정방향으로 보정한 뒤 서명영역을 찾아 확대합니다.
+          OCR 문자 중심각을 0/90/180/270°로 분류해 필요한 문서만 0° 정방향으로 보정한 뒤 서명영역을 찾습니다.
         </p>
       </div>
     </header>
@@ -442,6 +448,20 @@ export default function App(){
           </div>
 
           <p>
+            {r.orientationDetectedAngle!==null&&
+              <>
+                OCR 중심각 {r.orientationDetectedAngle.toFixed(1)}°
+                {r.orientationSnappedAngle!==null
+                  ?` → ${r.orientationSnappedAngle}° 범주`
+                  :''
+                }
+                {r.orientationVectorCount>0
+                  ?` · 유효 중심벡터 ${r.orientationVectorCount}개`
+                  :''
+                }
+                <br/>
+              </>
+            }
             원본 파일은 변경하거나 저장하지 않고,
             아래 서명 탐지만 이 정방향을 기준으로 진행합니다.
           </p>

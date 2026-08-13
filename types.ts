@@ -49,6 +49,9 @@ export interface FileResult {
 
   orientationCorrection:0|90|180|270
   orientationConfidence:number
+  orientationDetectedAngle:number|null
+  orientationSnappedAngle:0|90|180|270|null
+  orientationVectorCount:number
   orientationOriginalPreview:string|null
   orientationCorrectedPreview:string|null
 
