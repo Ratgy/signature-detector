@@ -46,5 +46,9 @@ export interface FileResult {
   targetRect:Rect|null
   cropRect:Rect|null
   elapsedMs:number
+  orientationCorrection:0|90|180|270
+  orientationConfidence:number
+  normalizedUrl:string|null
+  normalizedName:string|null
   judgement?:'correct'|'partial'|'wrong'
 }

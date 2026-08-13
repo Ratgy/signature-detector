@@ -10,6 +10,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc=new URL(
 export type LoadedSource =
   | {type:'pdf';pdf:PDFDocumentProxy;pageCount:number}
   | {type:'image';image:HTMLImageElement;pageCount:1}
+  | {type:'canvas-pages';pages:HTMLCanvasElement[];pageCount:number;origin:'pdf'|'image'}
 
 export async function loadSource(file:File):Promise<LoadedSource>{
   const name=file.name.toLowerCase()
@@ -102,8 +103,58 @@ export async function renderPage(
     return renderImagePage(src.image,targetLongSide)
   }
 
+  if(src.type==='canvas-pages'){
+    const input=src.pages[pageIndex]
+    if(!input)throw new Error('페이지를 찾을 수 없습니다.')
+    const scale=Math.min(1.8,targetLongSide/Math.max(input.width,input.height))
+    const out=document.createElement('canvas')
+    out.width=Math.max(1,Math.round(input.width*scale))
+    out.height=Math.max(1,Math.round(input.height*scale))
+    const ctx=out.getContext('2d',{willReadFrequently:true})!
+    ctx.fillStyle='#fff'
+    ctx.fillRect(0,0,out.width,out.height)
+    ctx.imageSmoothingEnabled=true
+    ctx.imageSmoothingQuality='high'
+    ctx.drawImage(input,0,0,out.width,out.height)
+    return out
+  }
+
   const page=await src.pdf.getPage(pageIndex+1)
   return renderPdfPage(page,targetLongSide)
+}
+
+export function createCanvasSource(
+  pages:HTMLCanvasElement[],
+  origin:'pdf'|'image'
+):LoadedSource{
+  return{type:'canvas-pages',pages,pageCount:pages.length,origin}
+}
+
+export function rotateCanvas(
+  source:HTMLCanvasElement,
+  angle:0|90|180|270
+){
+  if(angle===0){
+    const copy=document.createElement('canvas')
+    copy.width=source.width
+    copy.height=source.height
+    copy.getContext('2d')!.drawImage(source,0,0)
+    return copy
+  }
+
+  const swap=angle===90||angle===270
+  const out=document.createElement('canvas')
+  out.width=swap?source.height:source.width
+  out.height=swap?source.width:source.height
+  const ctx=out.getContext('2d')!
+  ctx.fillStyle='#fff'
+  ctx.fillRect(0,0,out.width,out.height)
+  ctx.save()
+  ctx.translate(out.width/2,out.height/2)
+  ctx.rotate(angle*Math.PI/180)
+  ctx.drawImage(source,-source.width/2,-source.height/2)
+  ctx.restore()
+  return out
 }
 
 export function preprocess(
@@ -345,4 +396,99 @@ export function cropPage(
   ctx.imageSmoothingQuality='high'
   ctx.drawImage(raw,0,0,out.width,out.height)
   return out
+}
+
+
+function canvasToBlob(canvas:HTMLCanvasElement,type:string,quality?:number){
+  return new Promise<Blob>((resolve,reject)=>{
+    canvas.toBlob(blob=>blob?resolve(blob):reject(new Error('이미지 저장 실패')),type,quality)
+  })
+}
+
+function concatBytes(parts:Uint8Array[]){
+  const total=parts.reduce((s,p)=>s+p.length,0)
+  const out=new Uint8Array(total)
+  let offset=0
+  for(const part of parts){out.set(part,offset);offset+=part.length}
+  return out
+}
+
+async function canvasesToPdfBlob(pages:HTMLCanvasElement[]){
+  const encoder=new TextEncoder()
+  const objects:{id:number;parts:Uint8Array[]}[]=[]
+  const pageIds:number[]=[]
+  let nextId=3
+
+  for(let i=0;i<pages.length;i++){
+    const canvas=pages[i]
+    const pageId=nextId++
+    const contentId=nextId++
+    const imageId=nextId++
+    pageIds.push(pageId)
+
+    const jpeg=await canvasToBlob(canvas,'image/jpeg',.92)
+    const jpegBytes=new Uint8Array(await jpeg.arrayBuffer())
+    const w=canvas.width
+    const h=canvas.height
+    const imageHeader=encoder.encode(
+      `${imageId} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${w} /Height ${h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpegBytes.length} >>\nstream\n`
+    )
+    const imageFooter=encoder.encode(`\nendstream\nendobj\n`)
+    objects.push({id:imageId,parts:[imageHeader,jpegBytes,imageFooter]})
+
+    const contentText=`q\n${w} 0 0 ${h} 0 0 cm\n/Im${i} Do\nQ\n`
+    const contentBytes=encoder.encode(contentText)
+    objects.push({
+      id:contentId,
+      parts:[encoder.encode(`${contentId} 0 obj\n<< /Length ${contentBytes.length} >>\nstream\n`),contentBytes,encoder.encode(`endstream\nendobj\n`)]
+    })
+
+    objects.push({
+      id:pageId,
+      parts:[encoder.encode(
+        `${pageId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w} ${h}] /Resources << /XObject << /Im${i} ${imageId} 0 R >> >> /Contents ${contentId} 0 R >>\nendobj\n`
+      )]
+    })
+  }
+
+  objects.push({id:1,parts:[encoder.encode(`1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n`)]})
+  objects.push({id:2,parts:[encoder.encode(`2 0 obj\n<< /Type /Pages /Count ${pageIds.length} /Kids [${pageIds.map(id=>`${id} 0 R`).join(' ')}] >>\nendobj\n`)]})
+  objects.sort((a,b)=>a.id-b.id)
+
+  const header=encoder.encode('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n')
+  const chunks:Uint8Array[]=[header]
+  const offsets:number[]=[0]
+  let length=header.length
+  for(const obj of objects){
+    offsets[obj.id]=length
+    for(const part of obj.parts){chunks.push(part);length+=part.length}
+  }
+
+  const xrefOffset=length
+  const maxId=Math.max(...objects.map(o=>o.id))
+  let xref=`xref\n0 ${maxId+1}\n0000000000 65535 f \n`
+  for(let id=1;id<=maxId;id++){
+    xref+=`${String(offsets[id]??0).padStart(10,'0')} 00000 n \n`
+  }
+  const trailer=`trailer\n<< /Size ${maxId+1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`
+  chunks.push(encoder.encode(xref+trailer))
+  return new Blob([concatBytes(chunks)],{type:'application/pdf'})
+}
+
+export async function sourceToNormalizedBlob(
+  src:LoadedSource,
+  originalMime:string,
+  originalName:string
+){
+  if(src.type!=='canvas-pages'){
+    throw new Error('정규화된 캔버스 소스가 필요합니다.')
+  }
+
+  if(src.origin==='pdf'){
+    return canvasesToPdfBlob(src.pages)
+  }
+
+  const page=src.pages[0]
+  const png=originalMime==='image/png'||originalName.toLowerCase().endsWith('.png')
+  return canvasToBlob(page,png?'image/png':'image/jpeg',png?undefined:.95)
 }

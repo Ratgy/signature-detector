@@ -6,6 +6,7 @@ import {
 } from 'react'
 
 import {assessTokens} from './detection'
+import {normalizeOrientation} from './orientation'
 import {recognizePage,terminateOCR} from './ocr'
 import {
   buildFallbackRegions,
@@ -26,7 +27,7 @@ import type {
   TargetCandidate
 } from './types'
 
-const VERSION='15.0'
+const VERSION='16.0'
 const BUILD='2026-08-13'
 
 const makeId=()=>Math.random().toString(36).slice(2)
@@ -47,7 +48,11 @@ const emptyResult=(file:File):FileResult=>({
   cropPreview:null,
   targetRect:null,
   cropRect:null,
-  elapsedMs:0
+  elapsedMs:0,
+  orientationCorrection:0,
+  orientationConfidence:0,
+  normalizedUrl:null,
+  normalizedName:null
 })
 
 export default function App(){
@@ -92,10 +97,19 @@ export default function App(){
       const tick=ticks.current[index]
       setResults(prev=>prev.map((r,i)=>{
         if(i!==index||r.status!=='processing'||r.progress>=96)return r
+        const stageCeiling=
+          r.message.includes('방향')||r.message.includes('회전')
+            ?32
+            :r.message.includes('저화질')||r.message.includes('보정 판독')
+              ?92
+              :r.message.includes('확대')
+                ?97
+                :72
+        if(r.progress>=stageCeiling)return r
         const move=
-          r.progress<55||
-          (r.progress<82&&tick%3===0)||
-          (r.progress>=82&&tick%8===0)
+          r.progress<40||
+          (r.progress<75&&tick%3===0)||
+          (r.progress>=75&&tick%7===0)
         return move?{...r,progress:r.progress+1}:r
       }))
     },130)
@@ -113,7 +127,7 @@ export default function App(){
       processed,
       pageIndex,
       p=>update(index,{
-        progress:12+((pageNumber-1+p)/Math.max(1,pageCount))*45,
+        progress:36+((pageNumber-1+p)/Math.max(1,pageCount))*34,
         message:`${pageNumber}/${pageCount} 페이지 판독 중`
       }),
       false
@@ -132,7 +146,7 @@ export default function App(){
       contact.canvas,
       pageIndex,
       p=>update(index,{
-        progress:62+p*27,
+        progress:72+p*20,
         message:'저화질 스캔 보정 판독 중'
       }),
       true
@@ -165,8 +179,30 @@ export default function App(){
     update(index,{status:'processing',progress:1,message:'문서 준비 중'})
     startProgress(index)
 
-    const src=await loadSource(file)
-    update(index,{pageCount:src.pageCount,progress:7,message:'서명영역 탐색 중'})
+    const originalSrc=await loadSource(file)
+    const imageInput=originalSrc.type==='image'
+    update(index,{pageCount:originalSrc.pageCount,progress:4,message:'문자 방향 확인 중'})
+
+    // v16: 서명 탐지보다 먼저 문서 방향을 정규화한다.
+    const normalized=await normalizeOrientation(
+      file,
+      originalSrc,
+      (progress,message)=>update(index,{progress,message})
+    )
+    const normalizedUrl=URL.createObjectURL(normalized.blob)
+
+    update(index,{
+      progress:33,
+      message:normalized.correction===0?'정방향 확인 완료':'문서 방향 보정 완료',
+      orientationCorrection:normalized.correction,
+      orientationConfidence:normalized.confidence,
+      normalizedUrl,
+      normalizedName:normalized.fileName,
+      pageCount:normalized.source.pageCount
+    })
+
+    const src=normalized.source
+    update(index,{progress:35,message:'서명영역 탐색 중'})
 
     let best:TargetCandidate|null=null
     const pageHints:{pageIndex:number;hint:number}[]=[]
@@ -177,7 +213,7 @@ export default function App(){
       const page=await renderPage(
         src,
         pageIndex,
-        src.type==='image'?1900:1600
+        imageInput?1900:1600
       )
       pageCache.set(pageIndex,page)
 
@@ -204,7 +240,7 @@ export default function App(){
 
       for(const candidate of candidates){
         const page=pageCache.get(candidate.pageIndex)??await renderPage(
-          src,candidate.pageIndex,src.type==='image'?2100:1750
+          src,candidate.pageIndex,imageInput?2100:1750
         )
         pageCache.set(candidate.pageIndex,page)
 
@@ -230,7 +266,7 @@ export default function App(){
       return
     }
 
-    update(index,{progress:92,message:'서명영역 확대 중'})
+    update(index,{progress:94,message:'서명영역 확대 중'})
 
     // 결과/편집용은 원본 톤으로 다시 렌더. 같은 좌표를 원본과 확대본이 공유한다.
     const finalPage=await renderPage(src,best.pageIndex,1800)
@@ -254,6 +290,7 @@ export default function App(){
 
   async function start(){
     if(!files.length||processing)return
+    results.forEach(r=>{if(r.normalizedUrl)URL.revokeObjectURL(r.normalizedUrl)})
     setProcessing(true)
     setResults(files.map(emptyResult))
 
@@ -287,6 +324,7 @@ export default function App(){
           name.endsWith('.png')
       })
       .slice(0,5)
+    results.forEach(r=>{if(r.normalizedUrl)URL.revokeObjectURL(r.normalizedUrl)})
     setFiles(selected)
     setResults([])
   }
@@ -309,11 +347,11 @@ export default function App(){
   return <div className="app">
     <header>
       <div>
-        <p className="eyebrow">SCAN DETECTION · LINKED SIGNATURE EDITOR</p>
+        <p className="eyebrow">OCR ORIENTATION NORMALIZE · LINKED SIGNATURE</p>
         <h1>서명영역 탐지 v{VERSION}</h1>
         <div className="versionBadge">BUILD {VERSION} · {BUILD}</div>
         <p className="sub">
-          원본에서 서명영역을 찾고, 확대된 같은 영역에 쓴 획을 원본에도 실시간 반영합니다.
+          OCR로 문자 방향을 먼저 정방향으로 맞춘 뒤 서명영역 탐지를 실행합니다.
         </p>
       </div>
     </header>
@@ -332,7 +370,7 @@ export default function App(){
       />
       <div className="uploadIcon">5</div>
       <strong>{files.length?`${files.length}개 파일 선택됨`:'PDF / JPG / PNG 최대 5개'}</strong>
-      <span>스캔본에서 비어 있는 날짜·매수인·서명 영역을 찾습니다.</span>
+      <span>회전된 스캔도 먼저 정방향 파일로 보정한 뒤 서명영역을 찾습니다.</span>
     </section>
 
     {files.length>0&&<section className="batchList">
@@ -354,6 +392,14 @@ export default function App(){
         <div className="statusTop"><strong>{r.message}</strong><span className="bigPercent">{r.progress}%</span></div>
         <div className="progress"><i style={{width:`${r.progress}%`}}/></div>
       </>}
+
+      {r.normalizedUrl&&<div className="orientationResult">
+        <div>
+          <span>문서 방향</span>
+          <strong>{r.orientationCorrection===0?'정방향':`${r.orientationCorrection}° 회전 보정`}</strong>
+        </div>
+        <a href={r.normalizedUrl} download={r.normalizedName??undefined}>정방향 파일 저장</a>
+      </div>}
 
       {r.status==='success'&&r.pagePreview&&r.cropPreview&&r.targetRect&&r.cropRect&&
         <LinkedSignatureEditor

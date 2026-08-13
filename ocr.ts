@@ -100,3 +100,54 @@ export async function terminateOCR(){
     workerPromise=null
   }
 }
+
+export async function autoRotateProbe(
+  canvas:HTMLCanvasElement,
+  onProgress?:(p:number,s:string)=>void
+){
+  const worker=await getWorker(onProgress)
+  await worker.setParameters({
+    preserve_interword_spaces:'1',
+    user_defined_dpi:'300',
+    tessedit_pageseg_mode:PSM.AUTO
+  } as any)
+
+  const result:any=await worker.recognize(
+    canvas,
+    {rotateAuto:true},
+    {text:true,imageColor:true,blocks:false}
+  )
+
+  return{
+    text:String(result.data?.text ?? ''),
+    confidence:Number(result.data?.confidence ?? 0),
+    imageColor:String(result.data?.imageColor ?? '')
+  }
+}
+
+export async function scoreRotationProbe(canvas:HTMLCanvasElement){
+  const worker=await getWorker()
+  await worker.setParameters({
+    preserve_interword_spaces:'1',
+    user_defined_dpi:'220',
+    tessedit_pageseg_mode:PSM.SPARSE_TEXT
+  } as any)
+
+  const result:any=await worker.recognize(
+    canvas,
+    {},
+    {text:true,blocks:false}
+  )
+
+  const text=String(result.data?.text ?? '')
+  const confidence=Number(result.data?.confidence ?? 0)
+  const hangul=(text.match(/[가-힣]/g)??[]).length
+  const compact=text.replace(/\s+/g,'')
+
+  let keyword=0
+  for(const word of ['성능','자동차','점검','확인','매수인','서명','년','월','일']){
+    if(compact.includes(word))keyword+=1
+  }
+
+  return confidence + Math.min(28,hangul*.28) + keyword*6
+}
